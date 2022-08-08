@@ -1,0 +1,587 @@
+---
+title: "AGO2_clip_analysis"
+output:
+  word_document: default
+  html_notebook: default
+  pdf_document: default
+---
+
+<style>
+body {
+text-align: justify}
+</style>
+
+
+```{r setup_data, message=F,warning=F,echo=F}
+
+# Load necessary libraries
+library(tidyverse)
+library(ggrepel)
+library(ggbeeswarm)
+library(ggthemes)
+library(ggseqlogo)
+library(data.table)
+
+library(GenomicRanges) # deal with genomic intervals (e.g. bed files)
+#library(clusterProfiler)
+#library(PWMEnrich) # positional weight matrix 
+#library(PWMEnrich.Hsapiens.background) 
+#library(PWMEnrich.Mmusculus.background)
+
+library(BSgenome) # genome functions
+#library(BSgenome.Hsapiens.UCSC.hg38) # human genome
+library(BSgenome.Mmusculus.UCSC.mm10) # mouse genome
+
+library(Biostrings) # deals with sequences (e.g. fasta files)
+library(GenomicAlignments) # deals with genomic alignments (e.g. bam files)
+
+#library(annotatr) # annotation of genomic regions (alternative to homer)
+#library(universalmotif) # probably a library of motifs
+
+library(edgeR)
+
+library("extrafont")
+loadfonts(quiet=T)
+bs<-11
+bf<-"Arial"
+
+# Load necessary raw and processed data
+load("./data/mm92_anno.RData") 
+#load("./ago2_clip_enr_2021.RData")
+
+# load("./m6a_meta_mat_mm.RData") # m6a external data
+
+A_color<-"#0f9648"
+C_color<-"#255c99"
+G_color<-"#f7b32b"
+U_color<-"#d62839"
+
+source("./functions_clip2022.R")
+
+```
+
+```{r ense_slim,warning=F,message=F,echo=F}
+ense_slim<-ense %>% dplyr::select(ensembl_exon_id,rank,anti_rank,exon_chrom_start,exon_chrom_end,l_exon,l_5utr,l_cds,l_3utr,TIS,TTS,exon_class,ensembl_transcript_id)
+
+enst_slim<-enst %>% dplyr::select(external_transcript_name,transcript_biotype,transcript_length,canonical,ensembl_transcript_id,ensembl_gene_id)
+rownames(enst_slim)<-enst_slim$ensembl_transcript_id
+enst_slim<-enst_slim[ense_slim$ensembl_transcript_id,]
+
+ensg_slim<-ensg %>% dplyr::select(external_gene_name,ensembl_gene_id,gene_biotype,chr_ucsc=chromosome_ucsc,strand_ucsc)
+rownames(ensg_slim)<-ensg_slim$ensembl_gene_id
+ensg_slim<-ensg_slim[enst_slim$ensembl_gene_id,]
+
+ense_df<-cbind(ense_slim,enst_slim,ensg_slim)
+rownames(ense_df)<-str_c(ense_df$external_transcript_name,ense_df$rank,sep="_")
+#ense_df$coord<-paste(ense_df$exon_chrom_start,ense_df$exon_chrom_end,ense_df$chromosome_ucsc,ense_df$strand_ucsc,sep="_")
+
+ense_granges<-makeGRangesFromDataFrame(ense_df,
+                         keep.extra.columns=T,
+                         ignore.strand=F,
+                         seqinfo=NULL,
+                         seqnames.field="chr_ucsc",
+                         start.field="exon_chrom_start",
+                         end.field="exon_chrom_end",
+                         strand.field="strand_ucsc",
+                         starts.in.df.are.0based=F)
+
+
+ensg_df<-ensg %>% dplyr::select(external_gene_name,ensembl_gene_id,gene_biotype,chr_ucsc=chromosome_ucsc,strand_ucsc,start_position,end_position,description)
+
+ensg_granges<-makeGRangesFromDataFrame(ensg_df,
+                         keep.extra.columns=T,
+                         ignore.strand=F,
+                         seqinfo=NULL,
+                         seqnames.field="chr_ucsc",
+                         start.field="start_position",
+                         end.field="end_position",
+                         strand.field="strand_ucsc",
+                         starts.in.df.are.0based=F)
+
+
+```
+
+
+```{r, message=F,warning=F,echo=F}
+
+ago_covs<-resume_bedcoverage(dir="./data/coverage_beds/",
+                            name_cols=c(1,2,3,6), # numeric or vector: columns with feature names
+                            cov_col=8   # numeric: column with coverage values
+)
+
+
+
+```
+
+
+```{r, message=F,warning=F,echo=F}
+
+if(!("list" %in% class(ago_covs))){
+  ago_covs<-list(ago_covs)
+}
+union_covs<- unique(rbindlist(ago_covs))[order(rank(id_name))] 
+
+counts_raw_dt <- union_covs
+
+```
+
+```{r c_anno, message=F,warning=F, echo=F}
+
+c_anno<-data.table("sample"=colnames(counts_raw_dt[,-"id_name"]))
+#c_anno<- c_anno[(!sample %in% c("WT_1","MUT_1"))]
+
+c_anno_add <- c_anno[, c("condition","replicate") := tstrsplit(sample,"_",fixed=T)][,-"sample"]
+
+c_anno<-cbind(c_anno,c_anno_add)
+
+c_anno[,condition:=factor(condition, levels=c("ago2","input"))]
+c_anno[order(condition,replicate)] 
+
+vec <- c("id_name",c_anno$sample)
+counts_raw_dt<-counts_raw_dt[,..vec]
+```
+
+
+```{r filter, message=F,warning=F, echo=F}
+
+sig_thr<-5 #count threshold
+
+counts_long_dt<-counts_raw_dt[,id_name:=as.factor(id_name)]
+
+counts_long_dt<-melt.data.table(counts_long_dt, id.vars = c("id_name"),variable.name = "sample",value.name = "counts")
+
+setkey(counts_long_dt, sample)
+setkey(c_anno, sample)
+counts_long_dt<-counts_long_dt[c_anno, on = "sample"]
+
+counts_filter_dt <- counts_long_dt[,.(min_c = min(counts)), .(id_name,condition)][condition=="ago2"]
+
+counts_filter_dt<-counts_filter_dt[, .(passes_c = sum(min_c >= sig_thr)), .(id_name)]
+
+filter_id <- as.character(counts_filter_dt[passes_c > 0]$id_name)
+
+counts_dt<-counts_raw_dt[id_name %in% filter_id]
+
+```
+
+```{r, message=F,warning=F, echo=F}
+
+### Create peak annotation
+
+r_anno<-data.table("id_name"=counts_dt$id_name)
+
+r_anno <- r_anno[, c("chr","start","end","strand") := tstrsplit(id_name,"_",fixed=T)][,-"id_name"]
+
+r_anno[,start:=as.numeric(start)]
+r_anno[,end:=as.numeric(end)]
+
+r_anno[,start_n:=start+10]
+r_anno[,end_n:=end-10]
+
+chr_conversion_canonical <- data.table(
+   "chr_ens"=c("1","2","3","4","5","6","7","8","9","10",
+      "11","12","13","14","15","16","17","18","19","20",
+      "21","22","X","Y","MT"),
+   "chr_ucsc"=c("chr1","chr2","chr3","chr4","chr5","chr6","chr7","chr8","chr9","chr10",
+      "chr11","chr12","chr13","chr14","chr15","chr16","chr17","chr18","chr19","chr20",
+      "chr21","chr22","chrX","chrY","chrM"))  
+
+r_anno<-r_anno[chr %in% chr_conversion_canonical$chr_ucsc][end-start==21]
+
+peak_granges<-makeGRangesFromDataFrame(r_anno,
+                         keep.extra.columns=F,
+                         ignore.strand=F,
+                         seqinfo=NULL,
+                         seqnames.field="chr",
+                         start.field="start",
+                         end.field="end",
+                         strand.field="strand",
+                         starts.in.df.are.0based=T)
+
+r_anno[,peak_seq := str_replace_all(as.character(getSeq(BSgenome.Mmusculus.UCSC.mm10,peak_granges)),"T","U")]
+
+r_anno <- r_anno[!(str_detect(r_anno$peak_seq,"N")),] 
+
+peak_granges<-makeGRangesFromDataFrame(r_anno,
+                         keep.extra.columns=F,
+                         ignore.strand=F,
+                         seqinfo=NULL,
+                         seqnames.field="chr",
+                         start.field="start",
+                         end.field="end",
+                         strand.field="strand",
+                         starts.in.df.are.0based=T)
+
+nuc_granges<-makeGRangesFromDataFrame(r_anno,
+                         keep.extra.columns=F,
+                         ignore.strand=F,
+                         seqinfo=NULL,
+                         seqnames.field="chr",
+                         start.field="start_n",
+                         end.field="end_n",
+                         strand.field="strand",
+                         starts.in.df.are.0based=T)
+
+
+r_anno[,CL_seq := str_replace_all(as.character(getSeq(BSgenome.Mmusculus.UCSC.mm10,nuc_granges)),"T","U")]
+
+## Annotation (intergenic, intronic, exonic)
+
+r_anno[,region_class:="intergenic"]
+
+over_genes<- GenomicRanges::findOverlaps(peak_granges, ensg_granges)
+peak_genes <- peak_granges[queryHits(over_genes)] 
+exon_genes<- peak_granges[subjectHits(over_genes)] 
+
+r_anno[unique(queryHits(over_genes)),"region_class"]<-"intron"
+
+over_exons<- GenomicRanges::findOverlaps(peak_granges, ense_granges)
+peak_exons <- peak_granges[queryHits(over_exons)] 
+exon_exons<- ense_granges[subjectHits(over_exons)] 
+
+r_anno[unique(queryHits(over_exons)),"region_class"]<-"exon"
+
+r_anno[,region_class:=factor(region_class,levels=c("exon","intron","intergenic"))]
+r_anno[,id_name:=paste(chr,start,end,strand,sep="_")]
+counts_dt <-counts_dt[id_name %in% r_anno$id_name]
+
+```
+
+## Raw counts clustering before normalization
+
+```{r mds_counts, fig.height=4, fig.width=4, warning=FALSE, message=F, echo=FALSE}
+
+sample_data<-scale(t(counts_dt[,-"id_name"])) 
+sample_distances <- dist(sample_data, method = "euclidean") 
+
+mds_cmdscale <- as.data.frame(cmdscale(as.matrix(sample_distances)))
+colnames(mds_cmdscale) <- c("MDS_1","MDS_2")
+mds_cmdscale$sample <- rownames(mds_cmdscale)
+mds_cmdscale<-as.data.table(mds_cmdscale)
+
+setkey(mds_cmdscale, sample)
+mds_cmdscale<-mds_cmdscale[c_anno, on = "sample"]
+
+cmd<-ggplot(mds_cmdscale, aes(MDS_1, MDS_2, colour=condition)) + #plot according to the new coordinates
+  geom_point(size=2.5,alpha=.9) + #colour=factor(df) to choose colour according to the condition
+  geom_text_repel(aes(label=sample), size=0.3*bs, fontface = "bold",show.legend = F) + #geom_text_repel to add text within plot
+  #scale_colour_manual(values=col_vector) +
+  theme_bw(base_size = bs, base_family = bf) + 
+  theme(legend.position = "none", panel.grid.minor=element_blank())
+
+cmd
+
+#ggsave("./figures/counts_cmdscale.pdf", cmd, device=cairo_pdf,width = 3.5, height = 3.5, units = c("in"))
+
+
+```
+
+## Number of reads for each sample
+
+```{r,fig.height=3, fig.width=5, warning=F, message=F,echo=F}
+
+
+bar_dt<-data.table("sample"=colnames(counts_dt[,-"id_name"]),"count"=(colSums(counts_dt[,-"id_name"])/1000000))
+
+setkey(bar_dt, sample)
+bar_dt<-bar_dt[c_anno, on = "sample"]
+
+
+bp<-ggplot(bar_dt,aes(sample,count,fill=condition)) +
+  geom_bar(stat="identity",width=0.7) +
+  coord_flip() +
+  theme_bw(base_size = bs, base_family = bf) +
+  theme(axis.title.y=element_blank(),panel.border=element_blank(),axis.text.y = element_text(size=8, colour = "black")) +
+  theme(panel.grid.major.y = element_blank(),panel.grid.minor.x = element_blank())+
+  theme(legend.position = "na")+
+   #scale_fill_manual(values=col_vector)+
+  labs(y = "aligned reads (mln)") 
+ 
+bp
+
+#ggsave("./figures/Barplot_counts_nodup.pdf",bp,device=cairo_pdf,width = 3.5, height = 5, units = c("in"))
+
+```
+
+```{r edgeR, message=F,warning=F,echo=F}
+
+counts_df<-as.data.frame(counts_dt)
+rownames(counts_df)<-counts_df$id_name
+counts_df$id_name<-NULL
+
+edge_c <- DGEList(counts=counts_df,group=c_anno$condition,samples=c_anno,genes=r_anno) 
+edge_n <- calcNormFactors(edge_c,method="TMM") 
+norm_factors<-(edge_n$samples$lib.size*edge_n$samples$norm.factors)/mean(edge_n$samples$lib.size*edge_n$samples$norm.factors) 
+names(norm_factors)<-edge_n$samples$sample
+
+#norm_factors
+norm_dt<-data.table("sample"=names(norm_factors),
+                    "div_norm"=norm_factors)
+
+```
+
+```{r cpm_tables, message=F, warning=F, echo=F}
+
+cpm_table<-as.data.frame(cpm(edge_n,log=F))
+cpm_table_dt<-as.data.table(cpm_table)[,id:=rownames(cpm_table)]
+
+l_cpm_table<-melt.data.table(cpm_table_dt, id.vars = c("id"),variable.name = "sample",value.name = "cpm")
+
+setkey(l_cpm_table, sample)
+l_cpm_table<-l_cpm_table[c_anno, on = "sample"]
+
+cpm_dt<-l_cpm_table[, .(N=.N,avg=mean(cpm),sd=sd(cpm)), .(condition,id)][, se := sd/sqrt(N)]        
+            
+cpm_avg<- dcast(cpm_dt[,c("id","condition","avg")], id ~ condition, value.var = "avg")
+colnames(cpm_avg)[-1]<-paste0(colnames(cpm_avg)[-1],"_cpm_avg")
+
+cpm_se<- dcast(cpm_dt[,c("id","condition","se")], id ~ condition, value.var = "se")
+colnames(cpm_se)[-1]<-paste0(colnames(cpm_se)[-1],"_cpm_se")
+
+setkey(cpm_avg, id)
+setkey(cpm_se, id)
+
+cpm_avgse<-cpm_avg[cpm_se, on = "id"]
+
+```
+
+## Re-clustering after normalization
+
+
+```{r mds_fpkm, fig.height=4, fig.width=4, warning=F, message=F, echo=F}
+
+sample_data<-scale(t(cpm_table)) 
+sample_distances <- dist(sample_data, method = "euclidean") 
+
+mds_cmdscale <- as.data.frame(cmdscale(as.matrix(sample_distances)))
+colnames(mds_cmdscale) <- c("MDS_1","MDS_2")
+mds_cmdscale$sample <- rownames(mds_cmdscale)
+mds_cmdscale<-as.data.table(mds_cmdscale)
+
+setkey(mds_cmdscale, sample)
+mds_cmdscale<-mds_cmdscale[c_anno, on = "sample"]
+
+cmd<-ggplot(mds_cmdscale, aes(MDS_1, MDS_2, colour=condition)) + #plot according to the new coordinates
+  geom_point(size=2.5,alpha=.9) + #colour=factor(df) to choose colour according to the condition
+  geom_text_repel(aes(label=sample), size=0.3*bs, fontface = "bold",show.legend = F) + #geom_text_repel to add text within plot
+  #scale_colour_manual(values=col_vector) +
+  theme_bw(base_size = bs, base_family = bf) + 
+  theme(legend.position = "none", panel.grid.minor=element_blank())
+
+cmd
+
+#ggsave("./counts_cmdscale.pdf", cmd, device=cairo_pdf,width = 3.5, height = 3.5, units = c("in"))
+
+```
+
+## Re-clustering after normalization and collapse of replicates
+
+```{r mds_conditions, fig.height=2.5, fig.width=2.5, warning=F, message=F, echo=F, eval=F}
+
+sample_data<-scale(t(cpm_avg[,-1])) 
+sample_distances <- dist(sample_data, method = "euclidean") 
+
+mds_cmdscale <- as.data.frame(cmdscale(as.matrix(sample_distances)))
+colnames(mds_cmdscale) <- c("MDS_1","MDS_2")
+mds_cmdscale$condition <- rownames(mds_cmdscale)
+mds_cmdscale <- as.data.table(mds_cmdscale)
+
+mds_cmdscale[,condition:=tstrsplit(condition,"_",fixed=T,keep=1)]
+
+setkey(mds_cmdscale, condition)
+setkey(c_anno, condition)
+mds_cmdscale<-(mds_cmdscale[unique(c_anno, by = "condition"), on = "condition"])
+
+
+cmd<-ggplot(mds_cmdscale, aes(MDS_1, MDS_2, colour=condition)) + 
+  geom_point(size=2.5,alpha=.8) +
+  geom_text_repel(aes(label=condition), size=0.3*bs, fontface = "italic", show.legend = F) + #geom_text_repel to add text within plot
+  #scale_colour_manual(values=col_vector) +
+  theme_bw(base_size = bs, base_family = bf) + 
+  theme(legend.position = "none", panel.grid.minor=element_blank())
+
+cmd
+
+#ggsave("./mds_conditions.pdf", cmd, device=cairo_pdf,width = 3.7, height = 2.6, units = c("in"))
+
+```
+
+```{r design_1, message=F,warning=F,echo=F}
+
+design <- model.matrix(~0+group, data=edge_c$samples) #binary matrix to pair replicates (description of the conditions)
+colnames(design)<-levels(edge_c$samples$group)
+
+edge_d <- estimateDisp(edge_n,design,robust=T) # robust=TRUE to have a better estimation of the outliers and usually, at low l
+
+edge_f <- glmQLFit(edge_d,design,robust=T) #squeeze of the variance -> estimation of the quasi-likelihood (QL) dispersions around 
+
+```
+
+
+```{r degs,echo=F,message=F,warning=F}
+
+DEGs_wide_df<-r_anno
+
+DEGs_long_df<-NULL
+
+contro_list<-list("ago2_input"="ago2-input")
+
+for(contro_label in names(contro_list)){
+  contro <- makeContrasts(contro_list[[contro_label]],levels=design) 
+  
+  DEGs<-edgeRglmQLF(mat=edge_f, cpm_mat=edge_n, contro=contro, label=contro_label, sig_thr=0, sig_col="CPM", fc_thr=1, pval_thr=0.05, pval_col="p_val",names=T) 
+  DEGs_wide_df <-cbind(DEGs_wide_df,DEGs[,c(3,5,6,7)]) 
+  
+  DEGs<-edgeRglmQLF(mat=edge_f, cpm_mat=edge_n, contro=contro, label=contro_label, sig_thr=0, sig_col="CPM", fc_thr=1, pval_thr=0.05, pval_col="p_val",names=F) 
+  DEGs_long_df<-rbind(DEGs_long_df,DEGs)
+}
+
+rownames(DEGs_long_df)<-NULL
+
+#write.table(DEGs_wide_df, file="./DEGs.txt", sep="\t",row.names=F, quote=F)
+#save(cpm_df,DEGs_long_df, file="./DEGs.RData")
+
+```
+
+```{r, message=F,warning=F,echo=F}
+
+DEGs_cand<-as.data.table(DEGs_wide_df)[ago2_input_class=="+" & ago2_input_log2_FC>0]
+
+#DEGs_cand$MUT_WT_class <- recode(DEGs_cand$MUT_WT_class, "+" = "MUT_gain", "-"="MUT_loss", "=" = "COMMON")
+
+table(DEGs_cand$ago2_input_class,DEGs_cand$region_class)
+
+```
+
+
+```{r, message=F,warning=F,echo=F}
+
+degs_granges<-makeGRangesFromDataFrame(DEGs_cand,
+                         keep.extra.columns=T,
+                         ignore.strand=F,
+                         seqinfo=NULL,
+                         seqnames.field="chr",
+                         start.field="start",
+                         end.field="end",
+                         strand.field="strand",
+                         starts.in.df.are.0based=T)
+
+over_exons<- GenomicRanges::findOverlaps(degs_granges, ense_granges)
+
+degs_exons <- degs_granges[queryHits(over_exons)] 
+exon_exons<- ense_granges[subjectHits(over_exons)] 
+
+all_exons<-bind_cols(as_tibble(degs_exons),as_tibble(exon_exons))
+
+all_exons<- as.data.table(all_exons)
+setkey(all_exons,external_transcript_name,rank,ago2_input_class)
+all_exons[,c("external_transcript_name","rank","ago2_input_class")]
+
+```
+
+
+```{r annotation_integration, warning=F, message=F, echo=F}
+
+plot_df <- DEGs_cand
+
+unique(all_exons[transcript_biotype=="protein_coding"][,c("external_gene_name","ago2_input_class")])[, .(genes=.N),by=ago2_input_class]
+```
+
+```{r, warning=F, message=F, echo=F}
+
+coding_exons<-all_exons[transcript_biotype=="protein_coding"]
+coding_exons$transcript_region<-""
+coding_exons[which(coding_exons$l_5utr>0),"transcript_region"]<-"5_UTR"
+coding_exons[which(coding_exons$l_cds>0),"transcript_region"]<-"CDS"
+coding_exons[which(coding_exons$l_3utr>0),"transcript_region"]<-"3_UTR"
+
+setkey(coding_exons,external_gene_name,transcript_region,ago2_input_class)
+coding_exons[,c("external_gene_name","transcript_region","ago2_input_class")][,.(genes=.N),by=transcript_region]
+
+names_5<- coding_exons[which(coding_exons$l_5utr>0),"id_name"] %>% unlist() %>% unique()
+names_cds<- coding_exons[which(coding_exons$l_cds>0),"id_name"] %>% unlist() %>% unique()
+names_3<- coding_exons[which(coding_exons$l_3utr>0),"id_name"] %>% unlist() %>% unique()
+
+DEGs_cand[which(DEGs_cand$id_name %in% names_5),"region_class"]<-"5`UTR"
+DEGs_cand[which(DEGs_cand$id_name %in% names_cds),"region_class"]<-"CDS"
+DEGs_cand[which(DEGs_cand$id_name %in% names_3),"region_class"]<-"3`UTR"
+
+```
+
+```{r, warning=F, message=F, echo=F}
+
+plot_dt <- DEGs_cand #[id_name %in% coding_exons$id_name]
+
+```
+
+
+### Number of unique peaks (defined by x-link nucleotide)
+
+```{r, warning=F, message=F, echo=F, fig.width=6,fig.height=4, eval=F, echo=F}
+
+plot_dt <- DEGs_cand %>% as.data.frame() # %>% filter(region_class!="intergenic")
+plot_dt$region_class <- recode_factor(plot_dt$region_class, exon = "non-coding exon")
+plot_dt$region_class <- factor(plot_dt$region_class,levels=c("intergenic","intron","non-coding exon","5`UTR","CDS","3`UTR"))
+
+
+bp<-ggplot(plot_dt,aes(region_class,fill=region_class))+
+   geom_bar(width=.8,alpha=.9)+
+   theme_tufte(base_family = bf, base_size = bs)+
+   #facet_wrap(vars(region_class),ncol=1)+ #scales="free"
+   coord_flip()+
+   scale_fill_manual(values=rev(c("grey35","grey40","grey50","grey60","grey70","grey75")))+
+   theme(legend.position = "none")+
+   scale_y_log10(
+      name = "Peak count"
+      #labels = function(x) paste0(x / 1000, "k")
+      )+
+   labs(x="")
+
+bp
+
+ggsave("peaks_number.pdf",bp,device=cairo_pdf,width = 4.5, height = 2.5, units = c("in"))
+
+```
+
+```{r, warning=F, message=F, echo=F, fig.width=6,fig.height=3}
+
+plot_dt <- DEGs_cand #[id_name %in% coding_exons$id_name]
+
+bp<-ggplot(plot_dt,aes(CL_seq,fill=CL_seq))+
+   geom_bar(width=.8,alpha=.9)+
+   theme_tufte(base_family = bf, base_size = bs)+
+   #facet_wrap(vars(ago2_input_class),scales="free",ncol=4)+
+   scale_fill_manual(values=c(A_color,C_color,G_color,U_color))+
+   theme(legend.position = "none")+
+   scale_y_continuous(
+      name = "Peak count",
+      labels = function(x) paste0(x / 1000, "k"))+
+   labs(x="X-linked nt")
+
+bp
+
+ggsave("xlink_nucleotide.pdf",bp,device=cairo_pdf,width = 3, height = 2.5, units = c("in"))
+
+```
+
+```{r, warning=F, message=F, echo=F, fig.width=7,fig.height=3}
+
+
+###MUT_g_seqs<- plot_df %>% dplyr::filter(ago2_input_class=="+") %>% pull(peak_seq)
+MUT_g_seqs <- plot_dt [ago2_input_class=="+"]$peak_seq
+#MUT_l_seqs <- plot_dt [MUT_WT_class=="MUT_loss"]$peak_seq
+#MUT_c_seqs <- plot_dt [MUT_WT_class=="COMMON"]$peak_seq
+
+
+sele<-ggseqlogo(list("Ago2_logo"= MUT_g_seqs), ncol=1) +
+   theme_logo(base_size = 0.6*bs, base_family = bf) + 
+   theme(axis.text.x = element_blank()) + 
+   scale_y_continuous(breaks=seq(0,2,0.05))
+sele
+
+ggsave("Logos_q157r_as_db_SE.pdf",sele,device=cairo_pdf,width = 2.8, height = 1.5 , units = c("in"))
+
+
+
+```
+
