@@ -1,1 +1,1 @@
-This folder contains scripts for obtaining aligned eCLIP reads (BAM files), starting from sequencing raw data (FASTQ files). The details are specified for paired-end eCLIP libraries, but can be easily adapted to single-end libraries.
+This folder contains scripts for obtaining aligned freCLIP or eCLIP reads (BAM files), starting from sequencing raw data (FASTQ files). The details are specified for paired-end eCLIP libraries, but can be easily adapted to single-end libraries.
