@@ -11,7 +11,7 @@ analysis of eCLIP-seq and freCLIP-seq data, with worked examples.
 
 The experimental and data analysis pipelines for freCLIP-seq and eCLIP-seq are described in the following paper:
 
-*Biancon G, Busarello E, Joshi P, Lesch BJ,3 Halene S, Tebaldi T.*
+*Biancon G, Busarello E, Joshi P, Lesch BJ, Halene S, Tebaldi T.*
 **Fractionated eCLIP-seq (freCLIP-seq) to deconvolve in vivo protein-RNA contacts.**
 [*STAR Protoc. 2022, in press*](https://star-protocols.cell.com/)
 
