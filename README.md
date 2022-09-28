@@ -9,11 +9,15 @@ analysis of eCLIP-seq data and integration with other RNA omics
 
 ## Reference
 
-The dataset of worked example analyzed in __eCLIP_seq__ was generated for the results presented in the following paper:
+The dataset of the worked examples analyzed in __eCLIP_seq__ were generated for the results presented in the following papers:
 
 *Biancon G, Joshi P, Zimmer JT, Hunck T, Gao Y, Lessard MD, Courchaine E, Barentine AES, Machyna M, Botti V, Qin A, Gbyli R, Patel A, Song Y, Kiefer L, Viero G, Neuenkirchen N, Lin H, Bewersdorf J, Simon MD, Neugebauer KM, Tebaldi T, Halene S.*
 **Precision analysis of mutant U2AF1 activity reveals deployment of stress granules in myeloid malignancies***
 [*Mol Cell. 2022 Mar 17;82(6):1107-1122.e7*](https://doi.org/10.1016/j.molcel.2022.02.025)
+
+*Griffin KN, Walters BW, Li H, Wang H, Biancon G, Tebaldi T, Kaya CB, Kanyo J, Lam TT, Cox AL, Halene S, Chung JJ, Lesch BJ.*
+**Widespread association of the Argonaute protein AGO2 with meiotic chromatin suggests a distinct nuclear function in mammalian male reproduction***
+[*Genome Res. 2022 Sep 15*](https://doi.org/10.1101/gr.276578.122)
 
 ------------------------------------------------------------------------
 
