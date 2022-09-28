@@ -1,9 +1,9 @@
 # eCLIP_seq
-analysis of eCLIP-seq data and integration with other RNA omics 
+analysis of eCLIP-seq and freCLIP-seq data, with worked examples.
 
 ## Overview
 
- __eCLIP_seq__ is an R notebook containing an example analysis for identifying and quantifying protein-RNA interactions from eCLIP-seq experiments. 
+ __eCLIP_seq__ is a collection of bash scripts and R notebook containing analysis pipelines for identifying and quantifying protein-RNA interactions from eCLIP-seq and freCLIP-seq experiments. 
 
 ------------------------------------------------------------------------
 
