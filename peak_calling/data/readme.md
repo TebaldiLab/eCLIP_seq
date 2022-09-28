@@ -1,1 +1,1 @@
-Sample data necessary to run the analysis and display the results, based on AGO2 eCLIP
+Sample data necessary to run the analysis and display the results. Data are related to an Ago2 eCLIP dataset, obtained from the cytoplasmic fractions of mouse whole testis cells (Griffin et al., Genome Research 2022).
