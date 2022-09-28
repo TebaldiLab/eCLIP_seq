@@ -15,6 +15,8 @@ The experimental and data analysis pipelines for freCLIP-seq and eCLIP-seq are d
 **Fractionated eCLIP-seq (freCLIP-seq) to deconvolve in vivo protein-RNA contacts.**
 [*STAR Protoc. 2022, in press*](https://star-protocols.cell.com/)
 
+[![DOI](https://zenodo.org/badge/452647933.svg)](https://zenodo.org/badge/latestdoi/452647933)
+
 The dataset of the worked examples analyzed in __eCLIP_seq__ were generated for the results presented in the following papers:
 
 *Biancon G, Joshi P, Zimmer JT, Hunck T, Gao Y, Lessard MD, Courchaine E, Barentine AES, Machyna M, Botti V, Qin A, Gbyli R, Patel A, Song Y, Kiefer L, Viero G, Neuenkirchen N, Lin H, Bewersdorf J, Simon MD, Neugebauer KM, Tebaldi T, Halene S.*
