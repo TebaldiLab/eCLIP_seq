@@ -1,5 +1,5 @@
 # eCLIP_seq
-analysis of eCLIP-seq and freCLIP-seq data, with worked examples.
+Quantitative analysis of eCLIP-seq and freCLIP-seq data, with worked examples.
 
 ## Overview
 
