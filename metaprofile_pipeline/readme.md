@@ -1,5 +1,5 @@
 This folder contains the scripts and R notebooks necessary to compare occupancy profiles of specific transcript regions, starting from aligned reads (BAM files) and an annotation listing the regions of interest. Binding profiles are based on the position and the number of crosslinking sites, calculated from read 5’ end. The case study shown is based on a dataset where RNA binding of the splicing factor U2AF1 was quantified in HEL cells and a comparison between wildtype and mutant U2AF1 was performed, specifically looking at intron-exon junctions (Biancon et al., 2022). 
 
 *Biancon G, Joshi P, Zimmer JT, Hunck T, Gao Y, Lessard MD, Courchaine E, Barentine AES, Machyna M, Botti V, Qin A, Gbyli R, Patel A, Song Y, Kiefer L, Viero G, Neuenkirchen N, Lin H, Bewersdorf J, Simon MD, Neugebauer KM, Tebaldi T, Halene S.*
-**Precision analysis of mutant U2AF1 activity reveals deployment of stress granules in myeloid malignancies***
+**Precision analysis of mutant U2AF1 activity reveals deployment of stress granules in myeloid malignancies.**
 [*Mol Cell. 2022 Mar 17;82(6):1107-1122.e7*](https://doi.org/10.1016/j.molcel.2022.02.025)
