@@ -7,7 +7,13 @@ analysis of eCLIP-seq data and integration with other RNA omics
 
 ------------------------------------------------------------------------
 
-## Reference
+## References
+
+The experimental and data analysis pipelines for freCLIP-seq and eCLIP-seq are described in the following paper:
+
+*Biancon G, Busarello E, Joshi P, Lesch BJ,3 Halene S, Tebaldi T.*
+**Fractionated eCLIP-seq (freCLIP-seq) to deconvolve in vivo protein-RNA contacts***
+[*STAR Protoc. 2022, in press*]()
 
 The dataset of the worked examples analyzed in __eCLIP_seq__ were generated for the results presented in the following papers:
 
