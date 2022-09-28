@@ -11,29 +11,28 @@ text-align: justify}
 </style>
 
 
-
-```{r setup, message=FALSE,warning=FALSE,echo=FALSE}
+```{r initial_setup, message=F,warning=F,echo=F}
 
 #### Load necessary libraries and variables
+
+library(tidyverse) 
+library(ggrepel) # repel text = separate overlapping text in a plot
+library(ggseqlogo) # generate and plot sequence logo with ggplot
+library(data.table)
 
 library(GenomicAlignments) # Functions on aligned objects
 library(rtracklayer) # interface with genome browsers (UCSC) and import/manipulation of annotation tracks
 library(bamsignals) # required to generate coverage files
-library(tidyverse) 
-library(ggrepel) # repel text = separate overlapping text in a plot
+
 library(BSgenome) # genome functions
 library(BSgenome.Hsapiens.UCSC.hg38) # human genome
-library(ggseqlogo) # generate and plot sequence logo with ggplot
+
 library(edgeR) # perform differential analysis
-#library(gridExtra) # create multiple plots on the same image
 
-library("extrafont") # deal with the font of plots
-loadfonts()
-bs<-11
-bf<-"Arial"
-
-load("./data/hs91_anno.RData") # ensg, enst, ense annotation
-load("./data/rMATs_v4_nodup_dt.RData") # contains splicing analysis (no duplicates)
+library(extrafont) #for text in plots
+loadfonts(quiet=T) 
+bs<-11 #general setting in ggplot 
+bf<-"Arial" #general setting in ggplot
 
 Q157R_color<-"#5063A2"
 cQ157R_color<-"#323E65"
@@ -52,160 +51,188 @@ C_color<-"#255c99"
 G_color<-"#f7b32b"
 U_color<-"#d62839"
 
-source("./functions_clip2022.R")
-
-load("./data/clip_run_01_fastuniq_dt.RData") # data structures for the CLIP analysis (ense_all_dt, coord_all_dt, all_ranges,junct_cov_dt, junct_cov_filt_dt)
-load("./data/clip_run_02_fastuniq_dt.RData") # data structures for the CLIP analysis (coord_dt, exon_anno_dt, inex_ranges, inex_RNA, x3_list_dt)
-load("./data/clip_lib_size_norm.RData") # library size for each sample to use for normalization of metaprofiles of selected junctions or profiles of single junctions
+load("./data/U2AF_freclip_3SS.RData") # data structures for the CLIP analysis
 
 ```
 
 
-```{r sec struct, message=FALSE,warning=FALSE,echo=FALSE, eval=FALSE}
 
-# Create a fasta to calculate 3'SS secondary structure (100bp,-70;+30)
+```{r useful_functions, echo=F, message=F, warning=F}
 
-sec_struc_ranges<-ranges_inex(exon_df=coord_dt,
-                         start="exon_chrom_start",
-                         end="exon_chrom_end",
-                         chr="chromosome_ucsc",
-                         strand="strand_ucsc",
-                         names="coord",
-                         off_pre=40,
-                         off_post=20,
-                         correct0base=FALSE) 
+# U2AF_eCLIP functions ----
 
-sec_struc_sequence<-RNAsequences(in_ranges=sec_struc_ranges,
-                       genome=BSgenome.Hsapiens.UCSC.hg38,
-                       u_conv = FALSE)
+#### Custom functions to extract and work with junction data
 
-writeXStringSet(sec_struc_sequence,"./data/SS3_40_20.fasta", append=FALSE,  format="fasta") # for Vienna tool
+# Function that return granges centered on intron-exon junctions (3'SS) with predefined offsets (e.g. -10;+10)
+ranges_inex<-function(exon_df, # data frame/data table with exon coordinates
+                      start, # column with exon start
+                      end,  #column with exon end
+                      chr, #column with exon chromosome (ucsc format)
+                      strand, #column with exon strand (ucsc format)
+                      names="", # column with names to be given to GRanges object
+                      off_pre=10, # offset before inex junction
+                      off_post=10,  # offset after inex junction
+                      correct0base=FALSE){ # correct start for 0baseformat (0-based ucsc and 1-based ensembl) =FALSE because we will do a "manual" correction of the predefined offsets according to the strand
+  off_post<-off_post-1 #off_post in 3SS is within the exon so it has to be corrected from 1-based to 0-based
+  if(correct0base){
+    exon_df$hl_start<-exon_df[[start]]+1 # correct for 0 base (to 1-based to use with ensembl junction coordinates)
+  }else{exon_df$hl_start<-exon_df[[start]]}
+  exon_df$hl_end<-exon_df[[end]] # we want to correct only the exon start coordinate because only the start is inside the 3'SS
+  exon_df$gm_start<-ifelse(exon_df[[strand]]=="+",(exon_df$hl_start-off_pre),(exon_df$hl_end-off_post))
+  exon_df$gm_end<-ifelse(exon_df$strand=="+",(exon_df$hl_start+off_post),(exon_df$hl_end+off_pre))
+  #conventionally, the start is always smaller than the end, BUT in the negative strand the start is greater so it will be considered as the end, and the start of the inex has to be smaller than the end  
+  
+  out_ranges<-makeGRangesFromDataFrame(exon_df,seqnames.field = chr,start.field = "gm_start",end.field = "gm_end",strand.field=strand)
+  
+  if(names!=""){
+    out_ranges <- setNames(out_ranges, exon_df[[names]]) #set the names on the object and returns the object
+  }
+  return(out_ranges)
+}
+
+# Function that return granges centered on exon-intron (5'SS) junctions with predefined offsets
+
+ranges_exin<-function(exon_df, # data frame/data table with exon coordinates
+                      start, # column with exon start
+                      end,  #column with exon end
+                      chr, #column with exon chromosome (ucsc format)
+                      strand, #column with exon strand (ucsc format)
+                      names="", # column with names to be given to GRanges object
+                      off_pre=10, # offset before inex junction
+                      off_post=10,  # offset after inex junction
+                      correct0base=FALSE){ # correct start for 0baseformat?
+  off_pre<-off_pre-1 #off_pre in 5SS is within the exon so it has to be corrected from 1-based (ensembl) to 0-based (ucsc)
+  if(correct0base){
+    ### exon_df$hl_end<-exon_df[,end]+1 # correct for 0 base
+    exon_df$hl_end<-exon_df[[end]]+1  # correct for 0 base
+    }else{exon_df$hl_end<-exon_df[[end]]}
+  exon_df$hl_start<-exon_df[[start]]
+  exon_df$gm_start<-ifelse(exon_df[[strand]]=="+",(exon_df$hl_end-off_pre),(exon_df$hl_start-off_post))
+  exon_df$gm_end<-ifelse(exon_df$strand=="+",(exon_df$hl_end+off_post),(exon_df$hl_start+off_pre))
+  
+  out_ranges<-makeGRangesFromDataFrame(exon_df,seqnames.field = chr,start.field = "gm_start",end.field = "gm_end",strand.field=strand)
+  
+  if(names!=""){
+    out_ranges <- setNames(out_ranges, exon_df[[names]])
+  }
+  return(out_ranges)
+}
+
+
+# Function that extract RNAStringSet from a granges object and a genome
+
+RNAsequences<-function(in_ranges, # granges object
+                       genome=BSgenome.Hsapiens.UCSC.hg38, # genome to be used
+                       u_conv=TRUE){ # convert the DNA sequence to RNA: (T to U)
+  
+  DNA<-getSeq(genome,in_ranges)
+  ifelse(u_conv, RNA<-RNAStringSet(gsub("T","U",as.character(DNA))), RNA<-DNA)
+  return(RNA)
+}
+
+
+# Function to extract coverage given a set of junctions (used for metaprofiles)
+
+jCov<-function(input_list, # list with the coverage values of each junction (x3_list)
+               junction_vec,  #vector of junction names (defined by coordinates)
+               name="set1"){        # name given to the analysis (in a separate column)
+  out_dt<-NULL
+  for(exp in names(input_list)){
+    exp_dt<-input_list[[exp]]
+    exp_dt<-exp_dt[id %in%junction_vec]
+    
+    filt_vec_dt<-data.table("id"=exp_dt$id, "rowSum"=rowSums(exp_dt[,-"id"]))
+    filt_vec_dt<-filt_vec_dt[rowSum<=2^boxplot(log2(rowSum[rowSum>0]),plot = F)$stats[5]]
+    filt_dt<-exp_dt[id %in% filt_vec_dt$id] 
+    
+    # the boxplot formula calculates 5 thresholds, three for the definition of the box, two for the whiskers. 
+    # the 5th threshold is the upper whisker and we want to eliminate junctions with "excess" of signal
+    # 2^ because we want to remove the log2 (applied by default in the boxplot)
+    exp_out<-data.table(position=as.integer(colnames(exp_dt[,-"id"])), # positions relative to 3'SS
+                        n_all=nrow(exp_dt), # number of all junctions considered
+                        n_trim=nrow(filt_dt), # number of junctions (trimmed for outliers)
+                        sum_all=colSums(exp_dt[,-"id"]), # sum of the signal (all)
+                        sum_trim=colSums(filt_dt[,-"id"]), # sum of the signal (trimmed)
+                        mean_all=colMeans(exp_dt[,-"id"]), # mean of the signal (all)
+                        mean_trim=colMeans(filt_dt[,-"id"]), # mean of the signal (trimmed)
+                        sample=exp, stringsAsFactors = F) # sample
+    out_dt<-rbind(out_dt,exp_out)
+  }
+  out_dt$jclass<-name
+  return(out_dt)
+}
+
+# Function to build datatable/frames for plotting profiles of selected junctions
+
+jBuild <- function(sample_dt){ #dt filtered with conditions to consider
+  
+  t_test_dt<-unique(sample_dt[,t.test(signal_per_million ~ genotype,.SD), by=c("wrapper","position")], by=c("wrapper","position","p.value"))[,p.value_1tail:=p.value/2]
+
+  cond_dt <- sample_dt[,.(N=.N, median=median(signal_per_million),
+                          mean=mean(signal_per_million), 
+                          sd=sd(signal_per_million)), by=c("protein","genotype","treatment","fraction","library","condition","jclass","position","wrapper")][
+                            ,se:=sd/sqrt(N)]
+  
+  cond_dt[is.na(se), se:= mean*0.1]
+  
+  plot_roof<- cond_dt[,.(plot_roof=max(mean),consistency_threshold=max(mean-se)), by="wrapper"][,
+                       plot_validation:=consistency_threshold>plot_roof/20][,c("wrapper","plot_roof","plot_validation")]
+                                                            
+  cond_dt <- cond_dt[plot_roof,on="wrapper"]
+
+  cond_dt <- cond_dt[,point_validation:=(mean-se)>(plot_roof/20)]
+  
+  ref_cond_df <- cond_df %>% dplyr::filter(genotype=="WT") %>%
+    dplyr::select(position,wrapper,mean,se)
+  colnames(ref_cond_df) <- c("position","wrapper","mean_WT","se_WT")
+  
+  ref_cond_dt <- cond_dt[genotype=="WT",c("position","wrapper","mean","se")]
+  colnames(ref_cond_dt) <- c("position","wrapper","mean_WT","se_WT")
+  
+  delta_dt <- cond_dt[ref_cond_dt, on=c("position","wrapper")]
+  delta_dt <- delta_dt[,delta_mean:=mean-mean_WT][, delta_se:=se+se_WT][genotype!="WT"]
+  delta_dt <- delta_dt[t_test_dt, on=c("wrapper","position")]
+  return(list("cond_dt"=cond_dt,"delta_dt"=delta_dt))
+}
+
+
+## Crosslink coverage extraction cycle  from BAM files ----
+
+clip_run<-function(bam_dir, x_ranges){
+  
+  list_input<-list.files(path=bam_dir, pattern="bam$", full.names=F) #bam names with ""
+  x3_ranges<-x_ranges
+  x3_list<-list()
+
+  for (bam_file in list_input){
+  
+    bam_name<-substr(bam_file,1,(nchar(bam_file)-6))
+    trial_3<-bamProfile(bampath=paste0(bam_dir,bam_file),x3_ranges,verbose=F,ss=T) # consider the strand
+    sense_3<-lapply(trial_3, function(x) x[1,]) # keep sense signal
+    df_struct_3<-(as.data.frame(do.call(rbind, as.list(sense_3))))
+    colnames(df_struct_3)<-c(seq(-40,-1),seq(1,10)) # crosslinking shifts of -1, and deletion of 0
+    rownames(df_struct_3)<-names(x3_ranges)
+    x3_list[[bam_name]]<-df_struct_3
+  }
+
+  return(x3_list)  
+  
+}
 
 ```
 
-```{r annotation, message=FALSE,warning=FALSE,echo=FALSE, eval=FALSE}
-
-#### Create necessary annotation (unique dataset of 3'SS)
-
-ense_slim_dt<-as.data.table(ense)[,c("ensembl_exon_id","rank","is_constitutive","exon_chrom_start","exon_chrom_end","l_exon","exon_class","ensembl_transcript_id")]
-
-enst_slim_dt<-as.data.table(enst)[,c("ensembl_transcript_id","external_transcript_name","transcript_biotype","exon_count","canonical","ensembl_gene_id")]
-setkey(enst_slim_dt,ensembl_transcript_id,ensembl_gene_id)
-setkey(ense_slim_dt,ensembl_transcript_id)
-enst_slim_dt<-enst_slim_dt[ense_slim_dt[,c("ensembl_transcript_id")],on="ensembl_transcript_id"]
-
-ensg_slim_dt<-as.data.table(ensg)[,c("ensembl_gene_id","external_gene_name","gene_biotype","chromosome_ucsc","strand_ucsc")]
-setkey(ensg_slim_dt,ensembl_gene_id)
-ensg_slim_dt<-ensg_slim_dt[enst_slim_dt[,c("ensembl_gene_id")],on="ensembl_gene_id"]
-
-ense_all_dt<-cbind(ense_slim_dt,enst_slim_dt[,-c("ensembl_transcript_id","ensembl_gene_id")],ensg_slim_dt)
-ense_all_dt[,coord:=paste(exon_chrom_start,exon_chrom_end,chromosome_ucsc,strand_ucsc,sep="_")]
-ense_all_dt[,id:=paste0(external_transcript_name,"_",rank)]
-
-# Create unique 3'SS dataset
-
-coord_all_dt <- unique(ense_all_dt[,c("coord","exon_chrom_start","exon_chrom_end","chromosome_ucsc","strand_ucsc")])
-
-#dim(coord_all_dt) # 574391 junctions 
-
-```
-
+### Annotation of the available samples
 
 ```{r sample_annotation, echo=FALSE,message=FALSE,warning=FALSE}
 
-### Create sample annotation (conditions, replicates)
-
 c_anno<-data.table("sample"=colnames(junct_cov_dt[,-"id"]))
-
 c_anno_add <- as.data.table(c_anno)[,c("protein","genotype","treatment","fraction","library","replicate") := tstrsplit(sample,"_",fixed=T)][,-"sample"]
-
 c_anno<-cbind(c_anno,c_anno_add)
-
-c_anno[,condition:=paste(protein,genotype,treatment,fraction,library,sep="_")]
-
-c_anno[, .(number=.N), by=c("protein", "genotype", "treatment","fraction","library")]
-
-
+c_anno[,condition:=paste(protein,genotype,fraction,sep="_")]
+c_anno[, .(number=.N), by=c("protein", "genotype","fraction")]
 ```
 
-```{r coverage_junction_filter, echo=FALSE, eval=FALSE}
-
-### Remove junctions with low signal
-
-cov_thres<-10 # coverage threshold
-
-junct_cov_filtpar_dt <- junct_cov_dt[which(rowSums(junct_cov_dt[,-"id"]>=cov_thres)>1)]
-# only junctions with at least 10 reads, in at least 2 samples
-
-c_anno_clip <- c_anno[library == "clip"]
-vec<-c(c_anno_clip$sample,"id")
-junct_cov_filtpar_dt<-junct_cov_filtpar_dt[, ..vec]
-
-# for each row (junction), group the samples by condition (=group the replicates), keep the minimum number (min x), and then calculate the maximum of the minimum numbers
-junct_cov_filtpar_dt<-melt.data.table(junct_cov_filtpar_dt, id.vars = c("id"),variable.name = "replicate",value.name = "signal")
-junct_cov_filtpar_dt[,condition:=sub('[_][^_]+$',"", replicate)]
-filter_vec_dt<-junct_cov_filtpar_dt[,min:=(min(signal)),by=c("id","condition")][,.(max=max(min)),by="id"]
-
-#the maximum as to be greater than 10, it means that at least one condition has at least 10 reads in that junction 
-filt_junct_vec <- filter_vec_dt[max>=cov_thres,]$id
-junct_cov_filt_dt<-junct_cov_dt[id %in% filt_junct_vec]
-
-#save(ense_all_dt,coord_all_dt,all_ranges,junct_cov_dt, junct_cov_filt_dt, file="./data/clip_run_01_fastuniq_dt.RData")
-#here we save the junctions with CLIP signal in U2AF1 window, we don't want junctions with no U2AF1 signal
-
-```
-
-```{r clustering, fig.height=5, fig.width=7, warning=FALSE, echo=FALSE, eval=FALSE}
-
-### Raw counts clustering before normalization 
-# (based on the number of 5'end reads within filtered junctions in each sample)
-
-mydata<-t(scale(t(junct_cov_filt_dt[,-"id"]))) 
-dd <- dist(t(mydata), method = "euclidean") 
-hc <- hclust(dd, method="ward.D") 
-cut <- as.data.frame(cutree(hc, k=19)) # number of conditions
-colnames(cut) <- "cut"
-cut$names <- rownames(cut)
-cut<-cbind(cut,c_anno[sample %in% rownames(cut),]) 
-cut$cut<-as.numeric(as.factor(cut$condition)) 
-
-library(ggdendro)
-
-#remember that CUT is for labelling each of the condition with a different colours and it starts from cutree
-
-hcdata <- dendro_data(hc, type="rectangle") #extract data from a rectangle cluster tree (hierarchical clustering)
-hcdata$labels <- left_join(hcdata$labels, cut, by=c("label"="names")) 
-
-tt<-ggplot(hcdata$segments) + 
-  geom_segment(aes(x = x, y = y, xend = xend, yend = yend))+
-  geom_text(data = hcdata$labels, aes(x, y, label = label, colour=factor(cut)), 
-            hjust = -0.2, size = 2, fontface = "bold") + 
-  scale_colour_manual(values=rep("grey10",19)) +
-  labs(x="", y="") + coord_flip() + theme_dendro() + 
-  scale_y_reverse(expand = c(0.3, 0)) + theme(legend.position = "none")
-#tt
-
-#ggsave("./figures/counts_tree.pdf", tt, device=cairo_pdf,width = 4.5, height = 3.5, units = c("in"))
-
-```
-
-```{r mds, fig.height=4.5, fig.width=5, warning=FALSE, echo=FALSE, eval=FALSE}
-### Multidimensional scaling plot (cmdscale)
-
-mds_cmdscale <- as.data.frame(cmdscale(as.matrix(dd))) #cmdscale reduce in 2 dimension and calculate the distance in the projection
-mds_cmdscale$names <- rownames(mds_cmdscale)
-mds_cmdscale$cut <- cut$cut
-
-cmd<-ggplot(mds_cmdscale, aes(V1, V2, label=names)) + # plot according to the new coordiantes
-  geom_point(aes(colour=factor(cut)), size=2.3) +   # colour=factor(df) to choose colour according to the condition
-  geom_text_repel(aes(colour=factor(cut)), size=2.1, fontface = "bold") + #geom_text_repel to add text within plot
-  scale_colour_manual(values=rep("grey10",19)) +
-  theme_bw(base_size = bs, base_family = bf) + 
-  theme(legend.position = "none",axis.title=element_blank(), panel.grid.minor=element_blank())
-cmd
-#ggsave("./figures/counts_cmdscale.pdf", cmd, device=cairo_pdf,width = 3.5, height = 3.5, units = c("in"))
-
-```
+### Generation of an alluvial plot describing 3'SS junctions
 
 ```{r alluvial_trial, message=F,warning=F,fig.height=4,fig.width=8}
 
@@ -220,8 +247,6 @@ allu_pre_dt<-exon_anno_dt[coord_dt, on=c("exon_chrom_start", "exon_chrom_end", "
 allu_pre_dt[which(AG!="AG"),"AG"]<-"non AG"
 allu_pre_dt[which(AG!="AG"),"m3"]<-"non AG"
 allu_pre_dt[which(gene_biotype!="protein_coding"),"gene_biotype"]<-"non_coding"
-allu_pre_dt[which(is_constitutive!=1),"is_constitutive"]<-0
-allu_pre_dt[,is_constitutive:=factor(is_constitutive)]
 
 allu_dt<-unique(allu_pre_dt[exon_class!="U",c("exon_class","AG","m3","gene_biotype","coord")])[,.(freq= .N), by=c("exon_class","AG","m3","gene_biotype")]
 
@@ -233,7 +258,7 @@ allu_dt[,m3:=factor(m3,levels=c("non AG","C","U","A","G"))]
 
 allu_dt <- allu_dt[order(exon_class,AG,m3)]
 
-ggplot(allu_dt,
+allu_plot<-ggplot(allu_dt,
        aes(y = freq,
            axis1 = exon_class, axis2 = gene_biotype, axis3 = AG)) +
   geom_alluvium(aes(fill = m3), colour="white",
@@ -247,19 +272,72 @@ ggplot(allu_dt,
   scale_x_continuous(breaks = 1:3, labels = c("m3", "AG", "Class")) +
   coord_flip()
 
+allu_plot
 
 ```
 
+### Generation of the U2AF freCLIP metaprofile around covered 3'SS junctions
+
+```{r metaprofile frac all,fig.height=5,fig.width=5,echo=F,message=F}
 
 
-```{r create_ranges, message=FALSE,warning=FALSE,echo=FALSE, eval=FALSE}
-#### Calculate ranges and logos (using unique exon junction ids with enough coverage)
+junc_sele <- unique(exon_anno_dt$coord)
 
-coord_dt <- coord_all_dt[coord %in% junct_cov_filt_dt$id]
+out3<-jCov(input_list=x3_list_dt,
+           junction_vec=junc_sele,
+           name="meta_3SS")
 
-exon_anno_dt <- ense_all_dt[coord %in% junct_cov_filt_dt$id]
-                                    #exon_class%in%c("I","L") & 
-                                    #transcript_biotype=="protein_coding") # soft filter
+setkey(c_anno,sample)
+input_dt <- out3[c_anno, on="sample"]
+
+#consider each SINGLE SAMPLE and calculate the total signal from all the positions and the percentage of the signal for each position 
+
+sample_meta_dt<-input_dt[, c("tot_trim","tot_all"):=list(sum(sum_trim), sum(sum_all)), by= c("sample","jclass")][,signal_perc_trim:=(as.numeric(sum_trim)/as.numeric(tot_trim))*100][,signal_perc_all:= (as.numeric(sum_all)/as.numeric(tot_all))*100]
+#or _all
+
+#group all except replicates to calculate the stats and to plot the mean signal from the replicates
+
+cond_meta_dt<-sample_meta_dt[, .(N=.N,median=median(signal_perc_trim),mean=mean(signal_perc_trim),sd=sd(signal_perc_trim)), .(protein,genotype,treatment,fraction,library,condition,jclass,position)][, se := sd/sqrt(N)]        
+cond_meta_dt[is.na(se), se:= mean*0.1]
+
+input_selection<-cond_meta_dt[position%in%seq(-20,5)] # select specific nucleotides for the metaprofile
+input_selection[, genotype:=factor(genotype,levels=c("WT","S34F"))]
+
+input_selection[which(condition %in% c("U2AF1_WT_heavy","U2AF1_S34F_heavy")),"condition"] <- "Heavy fraction (U2AF1+U2AF2)"
+
+input_selection[which(condition %in% c("U2AF1_WT_light","U2AF1_S34F_light")),"condition"] <- "Light fraction (U2AF1)"
+
+input_selection[,condition:=factor(condition,levels=c("Heavy fraction (U2AF1+U2AF2)","Light fraction (U2AF1)"))]
+
+input_selection<-input_selection[order(genotype, position)]
+bs<-11
+ex<-ggplot(input_selection,aes(position,mean,col=genotype,fill=genotype)) +
+    geom_vline(xintercept=0,linetype=2,colour="grey20",alpha=0.8) +
+    facet_wrap(~ condition,scales="free_y",ncol=1) +
+    geom_ribbon(aes(ymin=mean-se,ymax=mean+se),alpha=0.2,colour=NA)+
+    geom_line(alpha=0.7) +
+    geom_point(alpha=0.8, size=bs*0.075) +
+    theme_bw(base_size = bs,base_family = bf)+
+    scale_colour_manual(name="genotype", values=c(WT_color,U_color)) +
+    scale_fill_manual(name="genotype", values=c(WT_color,U_color)) +
+    scale_x_continuous(breaks=c(seq(-100,-5,5),seq(5,100,5)))+
+    scale_y_continuous(breaks=seq(0,100,3))+
+    theme(legend.justification=c(0.01,0.99), legend.position=c(0.01,0.99)) +
+    theme(plot.title = element_text(hjust = 0.5,size=0.75*bs))+
+    theme(legend.text = element_text(size = 0.7*bs), legend.key.size = unit((0.015*bs),"in"))+
+    theme(legend.title = element_blank())+
+    theme(legend.box = "none")+
+    theme(panel.grid.minor = element_blank())+
+    labs(x="distance from junction (nt)",y="X-link events (%)")
+ex
+
+#ggsave("./3SS_metaprofile.pdf",ex,device=cairo_pdf,width = 3.5, height = 3.8, units = c("in"))
+
+```
+
+### Generate a logo from the sequences  of 3'SS junctions
+
+```{r plot_logos, message=F,warning=F,echo=F, fig.height=3,fig.width=10}
 
 # retrieve the range and the sequence used for the 3`SS metaprofile (50 nucleotides, -40 to +10)
 inex_ranges<-ranges_inex(exon_df=coord_dt,
@@ -274,333 +352,17 @@ inex_ranges<-ranges_inex(exon_df=coord_dt,
 
 inex_RNA<-RNAsequences(in_ranges=inex_ranges,
                        genome=BSgenome.Hsapiens.UCSC.hg38)
+
 inexLogo<-ggseqlogo(as.character(inex_RNA),seq_type="rna",method="bits")
-#inexLogo
-#ggsave("figures/SS3_logo_all.pdf",inexLogo,device=cairo_pdf,width = 9, height = 1.5, units = c("in"))
 
-
-# Create a fasta to calculate 3'SS strength
-## MaxEnt (http://hollywood.mit.edu/burgelab/maxent/Xmaxentscan_scoreseq_acc.html) developed by Gene Yeo 17 years ago. Basically we apply the same function for obtaining the inex ranges, but considering 23 nucleotides (20 in the intron, 3 in the exon) as requested by the web-based tool. Then we save the sequences (w/o u-conversion) in the fasta format and we submit them in the web page obtaining the score of the strength of the 3'SS of each junction, based on AG, polyU tract, exc (not well explained). The higher the score, the stronger (U2AF2 only vs U2AF2 helped by U2AF1) the 3'SS.
-
-allu_coord_dt <- coord_dt[coord %in% allu_pre_dt$coord]
-
-maxEnt3_ranges<-ranges_inex(exon_df=allu_coord_dt,
-                         start="exon_chrom_start",
-                         end="exon_chrom_end",
-                         chr="chromosome_ucsc",
-                         strand="strand_ucsc",
-                         names="coord",
-                         off_pre=20,
-                         off_post=3,
-                         correct0base=FALSE) 
-
-maxEnt3_DNA<-RNAsequences(in_ranges=maxEnt3_ranges,
-                       genome=BSgenome.Hsapiens.UCSC.hg38,
-                       u_conv = FALSE)
-
-writeXStringSet(maxEnt3_DNA,"./data/maxEnt3_allu.fasta", append=FALSE,  format="fasta")
-
-
-# retrieve the range and the sequence used for the 5`SS metaprofile (50 nucleotides, -10 to +40)
-exin_ranges<-ranges_exin(exon_df=coord_dt, #data frame or data table
-                         start="exon_chrom_start",
-                         end="exon_chrom_end",
-                         chr="chromosome_ucsc",
-                         strand="strand_ucsc",
-                         names="coord",
-                         off_pre=10,
-                         off_post=40,
-                         correct0base=FALSE) 
-exin_RNA<-RNAsequences(in_ranges=exin_ranges,
-                       genome=BSgenome.Hsapiens.UCSC.hg38)
-exinLogo<-ggseqlogo(as.character(exin_RNA),seq_type="rna",method="bits")
-#exinLogo
-
-# Ranges for x-link coverage (shifted to consider the fact that the X-link position is 1 nucleotide before the last nucleotide of the read)
-
-x3_ranges<-ranges_inex(exon_df=coord_dt,
-                         start="exon_chrom_start",
-                         end="exon_chrom_end",
-                         chr="chromosome_ucsc",
-                         strand="strand_ucsc",
-                         names="coord",
-                         off_pre=39, # Correction of shifts in x-link maps (then, when we rename the column, -39 will be -40 and this is the shift)
-                         off_post=11, # Correction of shifts in x-link maps (+1 nt in the exon to avoid to have the 0 position. In the end the range will be -40:-1;+1:+10)
-                         correct0base=FALSE) 
-
-x5_ranges<-ranges_exin(exon_df=coord_dt,
-                       start="exon_chrom_start",
-                       end="exon_chrom_end",
-                       chr="chromosome_ucsc",
-                       strand="strand_ucsc",
-                       names="coord",
-                       off_pre=9, # Correction of shifts in x-link maps (crosslink shift)
-                       off_post=41, # Correction of shifts in x-link maps (to avoid to have 0)
-                       correct0base=FALSE) 
+inexLogo
 
 ```
 
+### Generate a clip profile from a single 3'SS junction
 
-### Meta-profile of all INTERNAL exons in protein coding genes
-```{r metaprofile_general_internal,fig.height=8,fig.width=8,echo=FALSE}
+```{r metaprofile_poster,fig.height=6,fig.width=7,echo=F,message=F}
 
-load("./data/clip_run_02_fastuniq_dt.RData")
-
-junc_sele <- unique(exon_anno_dt[exon_class %in% c("I") & transcript_biotype%in%c("protein_coding")]$coord)
-
-out3<-jCov(input_list=x3_list_dt,
-           junction_vec=junc_sele,
-           name="internal")
-
-setkey(c_anno,sample)
-setkey(out3,sample)
-input_dt <- out3[c_anno, on="sample"]
-
-#consider each SINGLE SAMPLE and calculate the total signal from all the positions and the percentage of the signal for each position 
-
-sample_meta_dt<-input_dt[, c("tot_trim","tot_all"):=list(sum(sum_trim), sum(sum_all)), by= c("sample","jclass")][,signal_perc_trim:=(as.numeric(sum_trim)/as.numeric(tot_trim))*100][,signal_perc_all:= (as.numeric(sum_all)/as.numeric(tot_all))*100]
-
-#group all except replicates to calculate the stats and to plot the mean signal from the replicates
-cond_meta_dt<-sample_meta_dt[, .(N=.N,median=median(signal_perc_trim),mean=mean(signal_perc_trim),sd=sd(signal_perc_trim)), .(protein,genotype,treatment,fraction,library,condition,jclass,position)][, se := sd/sqrt(N)]        
-
-# we are interested only on se that we want to plot
-
-cond_meta_dt[is.na(se), se:= mean*0.1]
-
-input_selection<-cond_meta_dt[protein%in%c("U2AF1","U2AF2") &
-                                   genotype%in%c("WT","S34F","Q157R") &
-                                   treatment %in% c("dox","noinf") &
-                                   fraction %in% c("heavy","light","whole") &
-                                   library %in% c("clip") &
-                                   position%in%seq(-20,5)]
-# Plot comparing genotypes ----
-
-input_selection[, genotype:=factor(genotype,levels=c("WT","S34F","Q157R"))]
-input_selection[, wrapper:= paste(protein,treatment,fraction)]
-
-bs<-11
-ex<-ggplot(input_selection,aes(position,mean,col=genotype,fill=genotype)) +
-    geom_vline(xintercept=0,linetype=2,colour="grey20",alpha=0.8) +
-    #facet_grid(genexp ~ jclass,scales = "free") +
-    facet_wrap(~ wrapper,scales="free_y",ncol=2) + #facet_wrap wraps a 1d ribbon of panels into 2d. Better use of screen space than facet_grid() because most displays are roughly rectangular
-    geom_ribbon(aes(ymin=mean-se,ymax=mean+se),alpha=0.2,colour=NA)+
-    geom_line(alpha=0.8) +
-    geom_point(alpha=0.9, size=bs*0.075) +
-    theme_bw(base_size = bs,base_family = bf)+
-    scale_colour_manual(name="genotype", values=c(WT_color,S34F_color,Q157R_color)) +
-    scale_fill_manual(name="genotype", values=c(WT_color,S34F_color,Q157R_color)) +
-    scale_x_continuous(breaks=c(seq(-100,-5,5),seq(5,100,5)))+ #a tick mark is shown on every 5, in the intron (-) and in the exon (+); -100 + 100 even if our considered interval is -40 +10
-    #scale_y_continuous(breaks=seq(0,1,0.02))+
-    theme(legend.justification=c(0.01,0.99), legend.position=c(0.01,0.99)) +
-    theme(plot.title = element_text(hjust = 0.5,size=0.75*bs))+
-    theme(legend.text = element_text(size = 0.5*bs),
-    legend.key.size = unit((0.012*bs),"in"))+
-    #theme(legend.position = "none")+
-    theme(legend.title = element_blank())+
-    theme(legend.box = "horizontal")+
-    theme(panel.grid.minor = element_blank())+
-    labs(x="distance from junction (nt)",y="X-link events (%)")
-ex
-
-```
-
-### Meta-profile of all INTERNAL exons in protein coding genes -- INPUT
-```{r metaprofile_general_int_input,fig.height=4,fig.width=8,echo=FALSE}
-
-input_selection<-cond_meta_dt[protein%in%c("U2AF1","U2AF2") &
-                                   genotype%in%c("WT","S34F") &
-                                   treatment %in% c("dox","noinf") &
-                                   fraction %in% c("light","whole") &
-                                   library %in% c("input") &
-                                   position%in%seq(-40,10)]
-
-# Plot comparing genotypes ----
-
-input_selection[, genotype:=factor(genotype,levels=c("WT","S34F"))]
-input_selection[, wrapper:= paste(protein,treatment,fraction)]
-
-bs<-11
-ex<-ggplot(input_selection,aes(position,mean,col=genotype,fill=genotype)) +
-    geom_vline(xintercept=0,linetype=2,colour="grey20",alpha=0.8) +
-    #facet_grid(genexp ~ jclass,scales = "free") +
-    facet_wrap(~ wrapper,scales="free_y",ncol=2) + #facet_wrap wraps a 1d ribbon of panels into 2d. Better use of screen space than facet_grid() because most displays are roughly rectangular
-    geom_ribbon(aes(ymin=mean-se,ymax=mean+se),alpha=0.2,colour=NA)+
-    geom_line(alpha=0.8) +
-    geom_point(alpha=0.9, size=bs*0.075) +
-    theme_bw(base_size = bs,base_family = bf)+
-    scale_colour_manual(name="genotype", values=c(WT_color,S34F_color,Q157R_color)) +
-    scale_fill_manual(name="genotype", values=c(WT_color,S34F_color,Q157R_color)) +
-    scale_x_continuous(breaks=c(seq(-100,-5,5),seq(5,100,5)))+ #a tick mark is shown on every 5, in the intron (-) and in the exon (+); -100 + 100 even if our considered interval is -40 +10
-    #scale_y_continuous(breaks=seq(0,1,0.02))+
-    theme(legend.justification=c(0.01,0.99), legend.position=c(0.01,0.99)) +
-    theme(plot.title = element_text(hjust = 0.5,size=0.75*bs))+
-    theme(legend.text = element_text(size = 0.5*bs),
-    legend.key.size = unit((0.012*bs),"in"))+
-    #theme(legend.position = "none")+
-    theme(legend.title = element_blank())+
-    theme(legend.box = "horizontal")+
-    theme(panel.grid.minor = element_blank())+
-    labs(x="distance from junction (nt)",y="X-link events (%)")
-ex
-
-```
-
-### Meta-profile of FIRST exons in protein coding genes
-####promoter before the start of the first exon that usually is not spliced
-```{r metaprofile_general_first,fig.height=8,fig.width=8,echo=FALSE}
-
-#load("./data/clip_run_02.RData")
-
-junc_sele <- unique(exon_anno_dt[exon_class %in% c("F") & transcript_biotype%in%c("protein_coding")]$coord)
-
-out3<-jCov(input_list=x3_list_dt,
-           junction_vec=junc_sele,
-           name="first")
-
-setkey(out3,sample)
-input_dt <- out3[c_anno, on="sample"]
-
-#consider each SINGLE SAMPLE and calculate the total signal from all the positions and the percentage of the signal for each position 
-
-sample_meta_dt<-input_dt[, c("tot_trim","tot_all"):=list(sum(sum_trim), sum(sum_all)), by= c("sample","jclass")][,signal_perc_trim:=(as.numeric(sum_trim)/as.numeric(tot_trim))*100][,signal_perc_all:= (as.numeric(sum_all)/as.numeric(tot_all))*100]
-
-#group all except replicates to calculate the stats and to plot the mean signal from the replicates
-
-cond_meta_dt<-sample_meta_dt[, .(N=.N,median=median(signal_perc_trim),mean=mean(signal_perc_trim),sd=sd(signal_perc_trim)), .(protein,genotype,treatment,fraction,library,condition,jclass,position)][, se := sd/sqrt(N)]        
-
-#we are interested only on se that we want to plot 
-cond_meta_dt[is.na(se), se:= mean*0.1]
-
-input_selection<-cond_meta_dt[protein%in%c("U2AF1","U2AF2") &
-                                genotype%in%c("WT","S34F","Q157R") &
-                                treatment %in% c("dox","noinf") &
-                                fraction %in% c("heavy","light","whole") &
-                                library %in% c("clip") &
-                                position%in%seq(-20,5)]
-# Plot comparing genotypes ----
-
-
-input_selection[, genotype:=factor(genotype,levels=c("WT","S34F","Q157R"))]
-input_selection[, wrapper:= paste(protein,treatment,fraction)]
-
-bs<-11
-ex<-ggplot(input_selection,aes(position,mean,col=genotype,fill=genotype)) +
-    geom_vline(xintercept=0,linetype=2,colour="grey20",alpha=0.8) +
-    #facet_grid(genexp ~ jclass,scales = "free") +
-    facet_wrap(~ wrapper,scales="free_y",ncol=2) + #facet_wrap wraps a 1d ribbon of panels into 2d. Better use of screen space than facet_grid() because most displays are roughly rectangular
-    geom_ribbon(aes(ymin=mean-se,ymax=mean+se),alpha=0.2,colour=NA)+
-    geom_line(alpha=0.8) +
-    geom_point(alpha=0.9, size=bs*0.075) +
-    theme_bw(base_size = bs,base_family = bf)+
-    scale_colour_manual(name="genotype", values=c(WT_color,S34F_color,Q157R_color)) +
-    scale_fill_manual(name="genotype", values=c(WT_color,S34F_color,Q157R_color)) +
-    scale_x_continuous(breaks=c(seq(-100,-5,5),seq(5,100,5)))+ #a tick mark is shown on every 5, in the intron (-) and in the exon (+); -100 + 100 even if our considered interval is -40 +10
-    #scale_y_continuous(breaks=seq(0,1,0.02))+
-    theme(legend.justification=c(0.01,0.99), legend.position=c(0.01,0.99)) +
-    theme(plot.title = element_text(hjust = 0.5,size=0.75*bs))+
-    theme(legend.text = element_text(size = 0.5*bs),
-    legend.key.size = unit((0.012*bs),"in"))+
-    #theme(legend.position = "none")+
-    theme(legend.title = element_blank())+
-    theme(legend.box = "horizontal")+
-    theme(panel.grid.minor = element_blank())+
-    labs(x="distance from junction (nt)",y="X-link events (%)")
-ex
-
-```
-
-### Meta-profile of LAST exons in protein coding genes
-##### <span style="color:red">equal to INTERNAL meta-profile</span>
-```{r metaprofile_general_last,fig.height=8,fig.width=8,echo=FALSE}
-
-#load("./data/clip_run_02.RData")
-
-junc_sele <- unique(exon_anno_dt[exon_class %in% c("L") & transcript_biotype%in%c("protein_coding")]$coord)
-
-out3<-jCov(input_list=x3_list_dt,
-           junction_vec=junc_sele,
-           name="last")
-
-setkey(c_anno,sample)
-input_dt <- out3[c_anno, on="sample"]
-
-#consider each SINGLE SAMPLE and calculate the total signal from all the positions and the percentage of the signal for each position 
-
-sample_meta_dt<-input_dt[, c("tot_trim","tot_all"):=list(sum(sum_trim), sum(sum_all)), by= c("sample","jclass")][,signal_perc_trim:=(as.numeric(sum_trim)/as.numeric(tot_trim))*100][,signal_perc_all:= (as.numeric(sum_all)/as.numeric(tot_all))*100]
-
-
-#group all except replicates to calculate the stats and to plot the mean signal from the replicates
-
-cond_meta_dt<-sample_meta_dt[, .(N=.N,median=mean(signal_perc_trim),mean=mean(signal_perc_trim),sd=sd(signal_perc_trim)), .(protein,genotype,treatment,fraction,library,condition,jclass,position)][, se := sd/sqrt(N)]        
-
-# we are interested only on se that we want to plot
-cond_meta_dt[is.na(se), se:= mean*0.1]
-
-
-input_selection<-cond_meta_dt[protein%in%c("U2AF1","U2AF2") &
-                                genotype%in%c("WT","S34F","Q157R") &
-                                treatment %in% c("dox","noinf") &
-                                fraction %in% c("heavy","light","whole") &
-                                library %in% c("clip") &
-                                position%in%seq(-20,5)]
-
-# Plot comparing genotypes ----
-
-input_selection[, genotype:=factor(genotype,levels=c("WT","S34F","Q157R"))]
-input_selection[, wrapper:= paste(protein,treatment,fraction)]
-
-bs<-11
-ex<-ggplot(input_selection,aes(position,mean,col=genotype,fill=genotype)) +
-    geom_vline(xintercept=0,linetype=2,colour="grey20",alpha=0.8) +
-    #facet_grid(genexp ~ jclass,scales = "free") +
-    facet_wrap(~ wrapper,scales="free_y",ncol=2) + #facet_wrap wraps a 1d ribbon of panels into 2d. Better use of screen space than facet_grid() because most displays are roughly rectangular
-    geom_ribbon(aes(ymin=mean-se,ymax=mean+se),alpha=0.2,colour=NA)+
-    geom_line(alpha=0.8) +
-    geom_point(alpha=0.9, size=bs*0.075) +
-    theme_bw(base_size = bs,base_family = bf)+
-    scale_colour_manual(name="genotype", values=c(WT_color,S34F_color,Q157R_color)) +
-    scale_fill_manual(name="genotype", values=c(WT_color,S34F_color,Q157R_color)) +
-    scale_x_continuous(breaks=c(seq(-100,-5,5),seq(5,100,5)))+ #a tick mark is shown on every 5, in the intron (-) and in the exon (+); -100 + 100 even if our considered interval is -40 +10
-    #scale_y_continuous(breaks=seq(0,1,0.02))+
-    theme(legend.justification=c(0.01,0.99), legend.position=c(0.01,0.99)) +
-    theme(plot.title = element_text(hjust = 0.5,size=0.75*bs))+
-    theme(legend.text = element_text(size = 0.5*bs),
-    legend.key.size = unit((0.012*bs),"in"))+
-    #theme(legend.position = "none")+
-    theme(legend.title = element_blank())+
-    theme(legend.box = "horizontal")+
-    theme(panel.grid.minor = element_blank())+
-    labs(x="distance from junction (nt)",y="X-link events (%)")
-ex
-
-```
-
-### Possible example of known single junction with WT
-```{r metaprofile_poster,fig.height=5,fig.width=7,echo=F,message=F}
-
-load(file="./data/counts_exp_clip.RData")
-
-#norm_dt <- clip_lib_size_norm
-
-counts_clip_mincond_dt<-as.data.table(counts_clip_mincond_df)[,coord:=rownames(counts_clip_mincond_df)]
-
-setkey(counts_clip_mincond_dt,U2AF1_WT_dox_heavy_clip,U2AF1_WT_dox_light_clip)
-wt_frac <- counts_clip_mincond_dt[,c("U2AF1_WT_dox_heavy_clip","U2AF1_WT_dox_light_clip","coord")][order( -U2AF1_WT_dox_heavy_clip,-U2AF1_WT_dox_light_clip)]
-
-
-wt_frac<-allu_pre_dt[wt_frac, on=c("coord"),nomatch=0][gene_biotype=="protein_coding"][order(-U2AF1_WT_dox_heavy_clip,-U2AF1_WT_dox_light_clip)] 
-
-
-wt_frac <- wt_frac[!duplicated(external_gene_name),]
-
-#37172996_37173172_chr6_+ C G
-#46563858_46563932_chr21_+ C A
-#128809157_128809204_chr11_+ U A
-
-#54460766_54462037_chr19_+ U C
-#33573308_33573455_chr21_+ U G
-
-#48089750_48089824_chr4_- U G
 
 out3<-jCov(input_list=x3_list_dt,
            junction_vec="128809157_128809204_chr11_+",
@@ -609,33 +371,20 @@ out3<-jCov(input_list=x3_list_dt,
 
 setkey(c_anno,sample)
 input_dt <- out3[c_anno, on="sample"]
-#input_dt <- out3[norm_dt, on="sample"]
+
 
 #consider each SINGLE SAMPLE and calculate the total signal from all the positions and the percentage of the signal for each position 
-
 sample_meta_dt<-input_dt[, c("tot_trim","tot_all"):=list(sum(sum_trim), sum(sum_all)), by= c("sample","jclass")][,signal_perc_trim:=(as.numeric(sum_trim)/as.numeric(tot_trim))*100][,signal_perc_all:= (as.numeric(sum_all)/as.numeric(tot_all))*100]
 
-
-
-#_all instead of _trim because there is no sense to get rid of outliers when we are considering a single junction
 cond_meta_dt<-sample_meta_dt[, .(N=.N,median=median(signal_perc_all),mean=mean(signal_perc_all),sd=sd(signal_perc_all)), .(protein,genotype,treatment,fraction,library,condition,jclass,position)][, se := sd/sqrt(N)]        
 cond_meta_dt[is.na(se), se:= mean*0.1]
 
 
-input_selection<-cond_meta_dt[protein%in%c("U2AF1") &
-                                genotype%in%c("WT","S34F") &
-                                treatment %in% c("dox") &
-                                fraction %in% c("heavy","light") &
-                                library %in% c("clip") &
-                                position%in%seq(-20,5)]
-
-
+input_selection<-cond_meta_dt[position%in%seq(-20,5)]
 input_selection[, genotype:=factor(genotype,levels=c("WT","S34F"))]
 
-
-input_selection[which(condition %in% c("U2AF1_WT_dox_heavy_clip","U2AF1_S34F_dox_heavy_clip")),"condition"] <- "Heavy fraction (U2AF1+U2AF2)"
-
-input_selection[which(condition %in% c("U2AF1_WT_dox_light_clip","U2AF1_S34F_dox_light_clip")),"condition"] <- "Light fraction (U2AF1)"
+input_selection[which(condition %in% c("U2AF1_WT_heavy","U2AF1_S34F_heavy")),"condition"] <- "Heavy fraction (U2AF1+U2AF2)"
+input_selection[which(condition %in% c("U2AF1_WT_light","U2AF1_S34F_light")),"condition"] <- "Light fraction (U2AF1)"
 
 input_selection[,condition:=factor(condition,levels=c("Heavy fraction (U2AF1+U2AF2)","Light fraction (U2AF1)"))]
 
@@ -678,1252 +427,7 @@ ex<-ggplot(input_selection,aes(position,mean,col=genotype,fill=genotype)) +
     geom_text(data=j_seq_dt, aes(y=-(plot_roof/10), label=nucleotide),colour=j_seq_dt$n_col,size=0.256*bs)
 ex
 
-ggsave("./3SS_fract_ex3_PERC.pdf",ex,device=cairo_pdf,width = 3.5, height = 3.8, units = c("in"))
+# ggsave("./3SS_single.pdf",ex,device=cairo_pdf,width = 3.5, height = 3.8, units = c("in"))
 
 ```
-
-### U2AF1 U2AF2 eCLIP 
-```{r metaprofile whole,fig.height=4,fig.width=3,echo=F,message=F}
-
-# x-link per mln 
-
-load(file="./data/counts_exp_clip.RData")
-
-#norm_dt<- clip_lib_size_norm
-
-junc_sele <- unique(exon_anno_dt[exon_class %in% c("I","L") & (coord %in% allu_pre_dt$coord)]$coord)
-
-
-out3<-jCov(input_list=x3_list_dt,
-           junction_vec=junc_sele,
-           name="internal")
-
-setkey(c_anno,sample)
-input_dt <- out3[c_anno, on="sample"]
-
-#input_dt <- out3[norm_dt, on="sample"]
-
-#consider each SINGLE SAMPLE and calculate the total signal from all the positions and the percentage of the signal for each position 
-
-sample_meta_dt<-input_dt[, c("tot_trim","tot_all"):=list(sum(sum_trim), sum(sum_all)), by= c("sample","jclass")][,signal_perc_trim:=(as.numeric(sum_trim)/as.numeric(tot_trim))*100][,signal_perc_all:= (as.numeric(sum_all)/as.numeric(tot_all))*100]
-
-#group all except replicates to calculate the stats and to plot the mean signal from the replicates
-
-cond_meta_dt<-sample_meta_dt[, .(N=.N,median=median(signal_perc_trim),mean=mean(signal_perc_trim),sd=sd(signal_perc_trim)), .(protein,genotype,treatment,fraction,library,condition,jclass,position)][, se := sd/sqrt(N)]        
-
-# we are interested only on se that we want to plot
-cond_meta_dt[is.na(se), se:= mean*0.1]
-
-input_selection<-cond_meta_dt[protein%in%c("U2AF1","U2AF2") &
-                                genotype%in%c("WT") &
-                                treatment %in% c("dox") &
-                                fraction %in% c("light","whole") &
-                                library %in% c("clip") &
-                                position%in%seq(-20,5)]
-
-input_selection<-input_selection[condition!="U2AF1 WT dox light clip"]
-input_selection[, genotype:=factor(genotype,levels=c("WT"))]
-
-
-input_selection[which(condition=="U2AF1 WT dox whole clip"),"condition"] <- "U2AF1 eCLIP"
-
-input_selection[which(condition=="U2AF2 WT dox light clip"),"condition"] <- "U2AF2 eCLIP"
-
-bs<-11
-ex<-ggplot(input_selection,aes(position,mean,col=genotype,fill=genotype)) +
-    geom_vline(xintercept=0,linetype=2,colour="grey20",alpha=0.8) +
-    #facet_grid(genexp ~ jclass,scales = "free") +
-    facet_wrap(~ condition,scales="free_y",ncol=1) +
-    geom_ribbon(aes(ymin=mean-se,ymax=mean+se),alpha=0.2,colour=NA)+
-    geom_line(alpha=0.8) +
-    geom_point(alpha=0.9, size=bs*0.075) +
-    theme_bw(base_size = bs,base_family = bf)+
-    scale_colour_manual(name="genotype", values=c(WT_color)) +
-    scale_fill_manual(name="genotype", values=c(WT_color)) +
-    scale_x_continuous(breaks=c(seq(-100,-5,5),seq(5,100,5)))+
-    scale_y_continuous(breaks=seq(0,100,3))+
-    theme(legend.justification=c(0.01,0.99), legend.position=c(0.01,0.99)) +
-    theme(plot.title = element_text(hjust = 0.5,size=0.75*bs))+
-    theme(legend.text = element_text(size = 0.7*bs), legend.key.size = unit((0.015*bs),"in"))+
-    #theme(legend.position = "none")+
-    theme(legend.title = element_blank())+
-    theme(legend.box = "none")+
-    theme(panel.grid.minor = element_blank())+
-    labs(x="distance from junction (nt)",y="X-link events (%)")
-ex
-
-#ggsave("./figures/3SS_meta_whole_def.pdf",ex,device="pdf",width = 2.32, height = 3.555, units = c("in"))
-
-# to calculate the number of junctions without zero values in each condition
-counts <- counts_clip_pass_df[rownames(counts_clip_pass_df)%in%junc_sele,]
-u2af1_eclip <- rownames(counts)[which(counts$U2AF1_WT_dox_whole_clip==TRUE)] #73676
-u2af2_eclip <- rownames(counts)[which(counts$U2AF2_WT_dox_light_clip==TRUE)] #109990
-
-```
-
-### U2AF1 fract WT eCLIP 
-```{r metaprofile frac,fig.height=4,fig.width=3,echo=F,message=F}
-
-# x-link per mln 
-
-load(file="./data/counts_exp_clip.RData")
-
-#norm_dt <- clip_lib_size_norm
-
-junc_sele <- unique(exon_anno_dt[exon_class %in% c("I","L") & coord %in% allu_pre_dt$coord]$coord)
-
-out3<-jCov(input_list=x3_list_dt,
-           junction_vec=junc_sele,
-           name="internal")
-
-input_dt <- out3[c_anno, on="sample"]
-
-#input_dt <- out3[norm_dt, on="sample"]
-
-
-sample_meta_dt<-input_dt[, c("tot_trim","tot_all"):=list(sum(sum_trim), sum(sum_all)), by= c("sample","jclass")][,signal_perc_trim:=(as.numeric(sum_trim)/as.numeric(tot_trim))*100][,signal_perc_all:= (as.numeric(sum_all)/as.numeric(tot_all))*100]
-
-
-#or _all
-cond_meta_dt<-sample_meta_dt[, .(N=.N,median=median(signal_perc_trim),mean=mean(signal_perc_trim),sd=sd(signal_perc_trim)), .(protein,genotype,treatment,fraction,library,condition,jclass,position)][, se := sd/sqrt(N)]        
-
-cond_meta_dt[is.na(se), se:= mean*0.1]
-
-
-input_selection<-cond_meta_dt[protein%in%c("U2AF1") &
-                                genotype%in%c("WT") &
-                                treatment %in% c("dox") &
-                                fraction %in% c("heavy","light") &
-                                library %in% c("clip") &
-                                position%in%seq(-20,5)]
-
-input_selection[, genotype:=factor(genotype,levels=c("WT"))]
-
-input_selection[which(condition=="U2AF1 WT dox heavy clip"),"condition"] <- "Heavy fraction (U2AF1+U2AF2)"
-
-input_selection[which(condition=="U2AF1 WT dox light clip"),"condition"] <- "Light fraction (U2AF1)"
-
-input_selection[,condition:=factor(condition,levels=c("Heavy fraction (U2AF1+U2AF2)","Light fraction (U2AF1)"))]
-
-bs<-11
-ex<-ggplot(input_selection,aes(position,mean,col=genotype,fill=genotype)) +
-    geom_vline(xintercept=0,linetype=2,colour="grey20",alpha=0.8) +
-    #facet_grid(genexp ~ jclass,scales = "free") +
-    facet_wrap(~ condition,scales="free_y",ncol=1) +
-    geom_ribbon(aes(ymin=mean-se,ymax=mean+se),alpha=0.2,colour=NA)+
-    geom_line(alpha=0.8) +
-    geom_point(alpha=0.9, size=bs*0.075) +
-    theme_bw(base_size = bs,base_family = bf)+
-    scale_colour_manual(name="genotype", values=c(WT_color)) +
-    scale_fill_manual(name="genotype", values=c(WT_color)) +
-    scale_x_continuous(breaks=c(seq(-100,-5,5),seq(5,100,5)))+
-    scale_y_continuous(breaks=seq(0,100,3))+
-    theme(legend.justification=c(0.01,0.99), legend.position=c(0.01,0.99)) +
-    theme(plot.title = element_text(hjust = 0.5,size=0.75*bs))+
-    theme(legend.text = element_text(size = 0.7*bs), legend.key.size = unit((0.015*bs),"in"))+
-    #theme(legend.position = "none")+
-    theme(legend.title = element_blank())+
-    theme(legend.box = "none")+
-    theme(panel.grid.minor = element_blank())+
-    labs(x="distance from junction (nt)",y="X-link events (%)")
-ex
-
-#ggsave("./figures/data/3SS_meta_fract_def.pdf",ex,device=cairo_pdf,width = 2.4, height = 3.555, units = c("in"))
-
-# to calculate the number of junctions without zero values in each condition
-counts <- counts_clip_pass_df[rownames(counts_clip_pass_df)%in%junc_sele,]
-u2af1_heavy <- rownames(counts)[which(counts$U2AF1_WT_dox_heavy_clip==TRUE)] #18172
-u2af1_light <- rownames(counts)[which(counts$U2AF1_WT_dox_light_clip==TRUE)] #9550
-
-```
-
-```{r,fig.height=1.2,fig.width=3,echo=FALSE}
-
-# total junctions 129246
-
-logo_20_5<-ggseqlogo(list("logo_20_5"=as.character(subseq(inex_RNA[junc_sele],21,45))), ncol=1) + 
-  theme(axis.text.x = element_blank()) + scale_y_continuous(breaks=seq(0,2,1))
-logo_20_5
-
-#ggsave("./figures/data/logo_20_5.pdf",logo_20_5,device=cairo_pdf,width = 2.1, height = 1.12, units = c("in"))
-
-```
-
-### U2AF1 fract WT/SF/QR eCLIP Figure2A
-```{r metaprofile frac all,fig.height=4,fig.width=3,echo=F,message=F}
-
-load(file="./data/counts_exp_clip.RData")
-
-# x-link per mln 
-#norm_dt <- clip_lib_size_norm
-
-junc_sele <- unique(exon_anno_dt[exon_class %in% c("I","L") & (coord %in% allu_pre_dt$coord)]$coord)
-
-out3<-jCov(input_list=x3_list_dt,
-           junction_vec=junc_sele,
-           name="internal")
-
-setkey(c_anno,sample)
-input_dt <- out3[c_anno, on="sample"]
-
-#input_dt <- out3[norm_dt, on="sample"]
-
-#consider each SINGLE SAMPLE and calculate the total signal from all the positions and the percentage of the signal for each position 
-
-sample_meta_dt<-input_dt[, c("tot_trim","tot_all"):=list(sum(sum_trim), sum(sum_all)), by= c("sample","jclass")][,signal_perc_trim:=(as.numeric(sum_trim)/as.numeric(tot_trim))*100][,signal_perc_all:= (as.numeric(sum_all)/as.numeric(tot_all))*100]
-#or _all
-
-#group all except replicates to calculate the stats and to plot the mean signal from the replicates
-
-cond_meta_dt<-sample_meta_dt[, .(N=.N,median=median(signal_perc_trim),mean=mean(signal_perc_trim),sd=sd(signal_perc_trim)), .(protein,genotype,treatment,fraction,library,condition,jclass,position)][, se := sd/sqrt(N)]        
-cond_meta_dt[is.na(se), se:= mean*0.1]
-
-input_selection<-cond_meta_dt[protein%in%c("U2AF1") &
-                                genotype%in%c("WT","S34F") &
-                                treatment %in% c("dox") &
-                                fraction %in% c("light","heavy") &
-                                library %in% c("clip") &
-                                position%in%seq(-20,5)] 
-
-input_selection[, genotype:=factor(genotype,levels=c("WT","S34F"))]
-
-
-input_selection[which(condition %in% c("U2AF1_WT_dox_heavy_clip","U2AF1_S34F_dox_heavy_clip","U2AF1_Q157R_dox_heavy_clip")),"condition"] <- "Heavy fraction (U2AF1+U2AF2)"
-
-input_selection[which(condition %in% c("U2AF1_WT_dox_light_clip","U2AF1_S34F_dox_light_clip","U2AF1_Q157R_dox_light_clip")),"condition"] <- "Light fraction (U2AF1)"
-
-input_selection[,condition:=factor(condition,levels=c("Heavy fraction (U2AF1+U2AF2)","Light fraction (U2AF1)"))]
-
-input_selection<-input_selection[order(genotype, position)]
-bs<-11
-ex<-ggplot(input_selection,aes(position,mean,col=genotype,fill=genotype)) +
-    geom_vline(xintercept=0,linetype=2,colour="grey20",alpha=0.8) +
-    #facet_grid(genexp ~ jclass,scales = "free") +
-    facet_wrap(~ condition,scales="free_y",ncol=1) +
-    geom_ribbon(aes(ymin=mean-se,ymax=mean+se),alpha=0.2,colour=NA)+
-    geom_line(alpha=0.7) +
-    geom_point(alpha=0.8, size=bs*0.075) +
-    theme_bw(base_size = bs,base_family = bf)+
-    scale_colour_manual(name="genotype", values=c(WT_color,U_color)) +
-    scale_fill_manual(name="genotype", values=c(WT_color,U_color)) +
-    scale_x_continuous(breaks=c(seq(-100,-5,5),seq(5,100,5)))+
-    scale_y_continuous(breaks=seq(0,100,3))+
-    theme(legend.justification=c(0.01,0.99), legend.position=c(0.01,0.99)) +
-    theme(plot.title = element_text(hjust = 0.5,size=0.75*bs))+
-    theme(legend.text = element_text(size = 0.7*bs), legend.key.size = unit((0.015*bs),"in"))+
-    #theme(legend.position = "none")+
-    theme(legend.title = element_blank())+
-    theme(legend.box = "none")+
-    theme(panel.grid.minor = element_blank())+
-    labs(x="distance from junction (nt)",y="X-link events (%)")
-ex
-
-ggsave("./3SS_meta_fract_all.pdf",ex,device=cairo_pdf,width = 3.5, height = 3.8, units = c("in"))
-
-# to calculate the number of junctions without zero values in each condition
-counts <- counts_clip_pass_df[rownames(counts_clip_pass_df)%in%junc_sele,]
-u2af1_heavy <- rownames(counts)[which(counts$U2AF1_WT_dox_heavy_clip==TRUE | counts$U2AF1_S34F_dox_heavy_clip==TRUE | counts$U2AF1_Q157R_dox_heavy_clip==TRUE)] #37588
-u2af1_light <- rownames(counts)[which(counts$U2AF1_WT_dox_light_clip==TRUE | counts$U2AF1_S34F_dox_light_clip==TRUE | counts$U2AF1_Q157R_dox_light_clip==TRUE)] #13991
-
-```
-
-### Meta-profile of protein coding internal exons (CAG vs UAG vs AAG, for S34F)
-```{r protein_coding_metaprofile,fig.height=16,fig.width=10,echo=FALSE}
-
-# 1) Select all internal exons in protein coding genes
-
-junc_sele <- unique(exon_anno_dt[exon_class %in% c("I") & transcript_biotype%in%c("protein_coding")]$coord)
-
-m_sele_UAG<-names(inex_RNA)[subseq(inex_RNA,38,40)=="UAG"]
-junc_sele_UAG<-intersect(junc_sele,m_sele_UAG)
-out_UAG<-jCov(input_list=x3_list_dt,
-           junction_vec=junc_sele_UAG,
-           name="UAG") #name is the jclass column used for grouping
-
-m_sele_CAG<-names(inex_RNA)[subseq(inex_RNA,38,40)=="CAG"]
-junc_sele_CAG<-intersect(junc_sele,m_sele_CAG)
-out_CAG<-jCov(input_list=x3_list_dt,
-           junction_vec=junc_sele_CAG,
-           name="CAG")
-
-m_sele_AAG<-names(inex_RNA)[subseq(inex_RNA,38,40)=="AAG"]
-junc_sele_AAG<-intersect(junc_sele,m_sele_AAG)
-out_AAG<-jCov(input_list=x3_list_dt,
-           junction_vec=junc_sele_AAG,
-           name="AAG")
-
-# only 1159 junctions with -3G (1:10 of AAG that is the 3rd in terms of frequency)
-
-input_df<-rbind(out_UAG, out_CAG, out_AAG)
-
-input_dt <- as.data.table(input_df)[c_anno, on="sample"]
-
-
-sample_meta_dt<-input_dt[, c("tot_trim","tot_all"):=list(sum(sum_trim), sum(sum_all)), by= c("sample","jclass")][,signal_perc_trim:=(as.numeric(sum_trim)/as.numeric(tot_trim))*100][,signal_perc_all:= (as.numeric(sum_all)/as.numeric(tot_all))*100]
-
-cond_meta_dt<-sample_meta_dt[, .(N=.N,median=mean(signal_perc_trim),mean=mean(signal_perc_trim),sd=sd(signal_perc_trim)), .(protein,genotype,treatment,fraction,library,condition,jclass,position)][, se := sd/sqrt(N)]        
-
-cond_meta_dt[is.na(se), se:= mean*0.1]
-
-input_selection<-cond_meta_dt[protein%in%c("U2AF1","U2AF2") &
-                                genotype%in%c("WT","S34F","Q157R") &
-                                treatment %in% c("dox","noinf") &
-                                fraction %in% c("heavy","light","whole") &
-                                library %in% c("clip") &
-                                position%in%seq(-20,5)]
-
-# Plot comparing genotypes ----
-
-input_selection[, genotype:=factor(genotype,levels=c("WT","S34F","Q157R"))]
-input_selection[, wrapper:= paste(protein,treatment,fraction)]
-bs<-11
-ex<-ggplot(input_selection,aes(position,mean,col=jclass,fill=jclass)) +
-    geom_vline(xintercept=0,linetype=2,colour="grey20",alpha=0.8) +
-    facet_grid(wrapper ~ genotype,scales = "free") + # facet the wrapper (condition/row) in respect to the genotype (=column/title); basically what is before the ~ is vertical (wrapper ~.), what is after is horizontal (.~ genotype)
-  # facet is used for split the data
-    #facet_wrap(~ wrapper,scales="free_y",ncol=2) +
-    geom_ribbon(aes(ymin=mean-se,ymax=mean+se),alpha=0.2,colour=NA)+
-    geom_line(alpha=0.8) +
-    geom_point(alpha=0.9, size=bs*0.075) +
-    theme_bw(base_size = bs,base_family = bf)+
-    scale_colour_manual(name="class", values=c(A_color,C_color,U_color)) +
-    scale_fill_manual(name="class", values=c(A_color,C_color,U_color)) +
-    scale_x_continuous(breaks=c(seq(-100,-5,5),seq(5,100,5)))+
-    #scale_y_continuous(breaks=seq(0,1,0.02))+
-    theme(legend.justification=c(0.01,0.99), legend.position=c(0.01,0.99)) +
-    theme(plot.title = element_text(hjust = 0.7,size=0.75*bs))+
-    theme(legend.text = element_text(size = 0.7*bs),
-    legend.key.size = unit((0.018*bs),"in"))+
-    #theme(legend.position = "none")+
-    theme(legend.title = element_blank())+
-    theme(legend.box = "horizontal")+
-    theme(panel.grid.minor = element_blank())+
-    labs(x="distance from junction (nt)",y="X-link events (%)")
-ex
-
-```
-
-
-### Metaprofile based on the length of U stretches in the polypirimidine tract (from -4 to -40)
-```{r, message=FALSE,warning=FALSE,echo=FALSE,fig.height=3,fig.width=4}
-
-
-junc_sele <- unique(exon_anno_dt[exon_class %in% c("I") & transcript_biotype%in%c("protein_coding")]$coord)
-
-ppt_U<-data.frame("junc"=names(inex_RNA), # junction coordinates
-                  "U_length"=0)
-ppt_seq<-subseq(inex_RNA,1,37)
-for(l in c(1:37)){
-  motif<-paste(rep("U",l),collapse="") # collapse="" means no separator between Us so no "U" "U" but "UU"
-  pass<-which(vcountPattern(motif, ppt_seq)>0) # count the number of times that you can find that motif (=tot number of Us from 1 to 37) and keep the junctions where the motif has been found at least once; "pass" is a list of number where is number corresponds to the id junction number in "inex_RNA"
-  ppt_U[pass,"U_length"]<-l # keep only the junctions in "pass" and assign to U_length column the number of the Us in the considered motif; in this way, iterating the loop, every time that a motif with an higher number of Us is found in that junctions, the value in the U_length column is replaced by the new number
-}
-
-ppt_U_I<-ppt_U[which(ppt_U$junc%in%junc_sele),]
-
-hs<-ggplot(data=ppt_U_I,aes(x=U_length))+
-  annotate('rect', xmin = 0.5, xmax = 2.5, ymin = -Inf, ymax = Inf, alpha = .1, fill="blue")+ #according to the result in the histogram, taking the 3 more frequent lengths as the mean length of the U stretches; then "blue" area is for stretches shorter than the 3 most frequent lengths, "red" area is for stretches longer than the 3 most frequent lengths
-  annotate('rect', xmin = 5.5, xmax = Inf, ymin = -Inf, ymax = Inf, alpha = .1, fill="red")+
-  geom_bar(colour=NA,fill="grey50",alpha=0.9)+
-  theme_bw(base_size = bs,base_family = bf)+
-  theme(plot.title = element_text(hjust = 0.5,size=0.75*bs))+
-  theme(legend.text = element_text(size = 0.5*bs),
-        legend.key.size = unit((0.012*bs),"in"))+
-  theme(legend.title = element_blank())+
-  theme(legend.box = "horizontal")+
-  theme(panel.grid.minor = element_blank())+
-  scale_x_continuous(limits = c(0,20))+
-  labs(x="U stretch length",y="Counts")
-hs
-#ggsave("./figures/Hist_U_stretch.pdf",hs,device=cairo_pdf,width = 4, height = 2, units = c("in"))
-
-```
-
-
-### U2AF eCLIP differential analysis
-
-```{r load_data, echo=FALSE, eval=FALSE}
-load("./data/clip_run_01_fastuniq_dt.RData") # data structures for the CLIP analysis (ense_all_dt, coord_all_dt, all_ranges,junct_cov_dt, junct_cov_filt_dt)
-load("./data/clip_run_02_fastuniq_dt.RData") # data structures for the CLIP analysis (coord_dt, exon_anno_dt, inex_ranges, inex_RNA, x3_list_dt)
-load("./data/clip_lib_size_norm.RData") # library size for each sample to use for normalization of metaprofiles of selected junctions or profiles of single junctions
-```
-
-```{r single_junction_analysis, echo=FALSE}
-
-# Analysis of single junctions ----
-
-## here is not anymore position-specific considering all the junctions in all the replicates, here is junction-specific so we consider the signal from ALL THE POSITIONS IN EACH JUNCTION (rowSums because, in each sample-dataframe in x3_list, each row is a junction and each column is a position; in the dataframes that we have used for the metaprofile, grouping, each row correspond to a position and the condition name is repeated for 50 times [-40+10])
-
-names<-as.character(c(seq(-20,-1),seq(1,2))) # columns from -20 to +2 = U2AF heterodimer
-whole_list_dt<-lapply(x3_list_dt, function(x) { 
-  x[,  Reduce(`+`, .SD), .SDcols=names]})
-
-whole_dt<- as.data.table(do.call(cbind,whole_list_dt)) # with cbind each datatable in the x3_list_dt becomes a column, each row is a junction and the value in the sample corresponds to the signal OF EACH JUNCTION in the selected position RANGE
-id<-as.data.table(x3_list_dt[[1]][,id])
-colnames(id)<-"id"
-whole_dt<-cbind(id,whole_dt)
-
-names<-as.character(c(seq(-4,-1),seq(1,2))) # columns from -4 to +2 = U2AF1
-u2af1_list_dt<-lapply(x3_list_dt, function(x) { 
-  x[,  Reduce(`+`, .SD), .SDcols=names]})
- 
-u2af1_dt<-as.data.table(do.call(cbind, u2af1_list_dt))
-u2af1_dt<-cbind(id,u2af1_dt)
-
-#colnames(u2af1_dt[,-1])<-paste0("U2AF1reg_",colnames(u2af1_dt[,-1]))
-
-names<-as.character(seq(-20,-5)) # columns from -20 to -5 = U2AF2
-u2af2_list_dt<-lapply(x3_list_dt, function(x) {
-  x[,  Reduce(`+`, .SD), .SDcols=names]})
-
-u2af2_dt<-as.data.table(do.call(cbind, u2af2_list_dt))
-u2af2_dt<-cbind(id,u2af2_dt)
-
-#colnames(u2af2_dt[,-1])<-paste0("U2AF2reg_",colnames(u2af1_dt[,-1]))
-
-# then, comparing the LIGHT vs HEAVY in the differential binding analysis, we can obtain the junctions with increased binding in U2AF1 (+) or in the U2AF2 (-), in the MUTANT vs WT, in order to identify different bound junctions in the 2 genotypes
-
-```
-
-```{r sample_junction_selection, message=F, warning=F, eval=F}
-
-c_anno_sele <- c_anno[protein %in% c("U2AF1") &
-                        treatment %in% c("dox") &
-                          fraction %in% c("light","heavy") &
-                            library %in% c("clip")]
-
-c_anno_sele[,sample_sele:=paste(fraction,genotype,replicate,sep="_")]
-
-c_anno_sele[,cond_sele:=paste(fraction,genotype,sep="_")]
-
-c_anno_sele[,fraction:=factor(fraction,levels = unique(fraction))][,fraction := relevel(fraction, ref="heavy")] # relevel() re-orders the levels of a factor so that the level specified by ref is first and the others are moved down [only the levels,not the order in the datatable]
-
-c_anno_sele[,genotype:=factor(genotype,levels = unique(genotype))][,genotype := relevel(genotype, ref="WT")]
-vec<-c("id",c_anno_sele$sample)
-counts_raw_dt<- whole_dt[, ..vec] #each row is a juncton, each column a sample, each value is the number of single-nt reads in that position range
-
-sig_thr<-5 # count threshold (at least one condition with all the replicates with a signal of at least 5 to avoid inconsistent replicates)
-# here we are considering only fractionated clip, with less reads and a smaller window so here we are more stringent than the previous threshold
-
-counts_long_dt <- counts_raw_dt[,id:=as.factor(id)]
-
-#variable.name specifies the name of the column to create from the data stored in the columns
-#value.name specifies the name of the column to create from the data stored in cell values
-counts_long_dt<-melt.data.table(counts_long_dt, id.vars = c("id"),variable.name = "sample",value.name = "counts")
-
-#the first is bound on the left of the second and "by" specifies the name, in each dataset, of the column in common
-setkey(counts_long_dt, sample)
-setkey(c_anno_sele, sample_sele)
-#left_join
-counts_long_dt<-counts_long_dt[c_anno_sele, on = c("sample")]
-
-#calculate and keep the minimum count of the replicates in each condition
-counts_filter_dt <- counts_long_dt[,.(min_c = min(counts)), .(id,cond_sele)]
-
-#calculate for each junction in how many samples the minimum signal in all the replicates was at least 5 (=all the replicates had a signal of at least 5)
-counts_filter_dt <-counts_filter_dt[, .(passes_c = sum(min_c >= sig_thr)), .(id)]
-
-# signal filter (keep only the junctions with a signal of at least 5 in all the replicates of at least one condition) 
-sig_filter_id <- as.character(counts_filter_dt[passes_c > 0]$id)
-        
-# 55700 unique junctions vs 166508 unique junctions considering all the single-nt reads bam files
-
-#exon_anno_dt is derived from the eCLIP data so it already contains the filtered junctions with a signal of at least 10 in at least one condition, considering all the 49 files (clip/whole/fractionated/input/u2af1/u2af2) and a range from -40 to +10
-cod_filter_id <- unique(exon_anno_dt[gene_biotype %in% c("protein_coding") & exon_class %in% c("F","I","L")]$coord)
-
-filter_id <- intersect(sig_filter_id,cod_filter_id) # we intersect the 2 datatable because here we are considering only the fractionated files and a different window so here we don't want to select something that was not present before in the metaprofile analysis
-
-counts_dt<-counts_raw_dt[id %in% filter_id] #dataframe with columns=samples, rows=filtered junctions (signal), cells=reads in that position range (-30;+10)
-
-r_anno<-data.table("coord"=counts_dt$id)
-
-```
-
-```{r sample_junction_selection_u2af1_u2af2, message=F, warning=F}
-
-c_anno_sele1 <- c_anno[protein %in% c("U2AF1") & 
-                        treatment %in% c("dox") &
-                         fraction %in% c("light") &
-                          library %in% c("clip")]
-
-
-c_anno_sele1[,sample_sele:=paste(fraction,genotype,replicate,sep="_")]
-
-c_anno_sele1[,cond_sele:=paste(fraction,genotype,sep="_")]
-
-# c_anno_sele1[,fraction:=factor(fraction,levels = unique(fraction))][,fraction := relevel(fraction, ref="heavy")] # relevel() re-orders the levels of a factor so that the level specified by ref is first and the others are moved down [only the levels,not the order in the datatable]
-
-c_anno_sele1[,genotype:=factor(genotype,levels = unique(genotype))][,genotype := relevel(genotype, ref="WT")]
-vec1<-c("id",c_anno_sele1$sample)
-counts_raw_dt1<- u2af1_dt[,..vec1] #each row is a juncton, each column a sample, each value is the number of single-nt reads in that position range
-
-c_anno_sele2 <- c_anno[protein %in% c("U2AF1") &
-                        treatment %in% c("dox") &
-                         fraction %in% c("heavy") & 
-                          library %in% c("clip")]
-
-c_anno_sele2[,sample_sele:=paste(fraction,genotype,replicate,sep="_")]
-
-c_anno_sele2[,cond_sele:=paste(fraction,genotype,sep="_")]
-
-# c_anno_sele2[,fraction:=factor(fraction,levels = unique(fraction))][,fraction := relevel(fraction, ref="heavy")] # relevel() re-orders the levels of a factor so that the level specified by ref is first and the others are moved down [only the levels,not the order in the dataframe]
-
-c_anno_sele2[,genotype:=factor(genotype,levels = unique(genotype))][,genotype := relevel(genotype, ref="WT")]
-
-vec2<-c("id",c_anno_sele2$sample)
-counts_raw_dt2<- u2af2_dt[, ..vec2]#each row is a juncton, each column a sample, each value is the number of single-nt reads in that position range
-
-c_anno_sele <- rbind(c_anno_sele1,c_anno_sele2)
-
-c_anno_sele[,fraction:=factor(fraction,levels = unique(fraction))][,fraction := relevel(fraction, ref="heavy")]
-
-c_anno_sele[,genotype:=factor(genotype,levels = unique(genotype))][,genotype := relevel(genotype, ref="WT")]
-
-counts_raw_dt <- cbind(counts_raw_dt1,counts_raw_dt2[,-"id"])
-
-sig_thr<-5 # count threshold (at least one condition with all the replicates with a signal of at least 5 to avoid inconsistent replicates)
-# here we are considering only fractionated clip, with less reads and a smaller window so here we are more stringent than the previous threshold
-
-counts_long_dt <- counts_raw_dt[,id:=as.factor(id)]
-
-counts_long_dt<-melt.data.table(counts_long_dt, id.vars = c("id"),variable.name = "sample",value.name = "counts")
-
-#the first is bound on the left of the second and "by" specifies the name, in each dataset, of the column in common
-setkey(counts_long_dt, sample)
-setkey(c_anno_sele, sample_sele)
-#left_join
-counts_long_dt<-counts_long_dt[c_anno_sele, on = c("sample")]
-
-counts_filter_dt <- counts_long_dt[,.(min_c = min(counts)), .(id,cond_sele)]
-
-#calculate and keep the minimum count of the replicates in each condition
-counts_filter_dt <-counts_filter_dt[, .(passes_c = sum(min_c >= sig_thr)), .(id)]
-
-#calculate for each junction in how many samples the minimum signal in all the replicates was at least 5 (=all the replicates had a signal of at least 5)
-
-# signal filter (keep only the junctions with a signal of at least 5 in all the replicates of at least one condition) 
-sig_filter_id <- as.character(counts_filter_dt[passes_c > 0]$id)
-        
-# 23993 unique junctions vs 55700 unique junctions considering the entire window -20;+2 in both heavy and light fractions and vs 166508 unique junctions considering all the single-nt reads bam files
-
-#exon_anno_dt is derived from the eCLIP data so it already contains the filtered junctions with a signal of at least 10 in at least one condition, considering all the 49 files (clip/whole/fractionated/input/u2af1/u2af2) and a range from -40 to +10
-
-cod_filter_id <- unique(exon_anno_dt[gene_biotype %in% c("protein_coding") & exon_class %in% c("F","I","L")]$coord)
-
-filter_id <- intersect(sig_filter_id,cod_filter_id) # we intersect the 2 dataframe because here we are considering only the fractionated files and a different window so here we don't want to select something that was not present before in the metaprofile analysis
-
-counts_dt<-counts_raw_dt[id %in% filter_id] #datatable with columns=samples, rows=filtered junctions (signal), cells=reads in the selected position range
-
-r_anno<-data.table("coord"=counts_dt$id)
-
-```
-
-### Number of read-pairs aligned for each sample (after deduplication)
-
-```{r,fig.height=3, fig.width=3.5, warning=FALSE, echo=FALSE, eval=F}
-
-bar_dt<-data.table("id"=colnames(counts_dt[,-"id"]),"cond"=c_anno_sele$cond_sele,"count"=(colSums(counts_dt[,-"id"])/1000000))
-bp<-ggplot(bar_dt,aes(id,count,fill=factor(cond))) +
-  geom_bar(stat="identity",width=0.7) +
-  coord_flip() +
-  theme_bw(base_size = bs, base_family = bf) +
-  theme(axis.title.y=element_blank(),panel.border=element_blank(),axis.text.y = element_text(size=8, colour = "black")) +
-  theme(panel.grid.major.y = element_blank(),panel.grid.minor.x = element_blank())+
-  theme(legend.position = "na")+
-  #scale_fill_manual(values=time_color)
-  labs(y = "millions of aligned read pairs") +
-  labs(fill = "Condition") +
-  scale_fill_manual(values=c(Q157R_color,"#7282b4",S34F_color,"#fca660",WT_color,"grey70"))
-bp
-#ggsave("./figures/Barplot_counts_nodup.pdf",bp,device=cairo_pdf,width = 3.5, height = 5, units = c("in"))
-
-```
-
-### Graphical representation of the normalization procedure considering the biological coefficient of variation (BCV)
-
-```{r edgeR_analysis, fig.height=3.5, fig.width=4.5, message=F, warning=F, echo=F}
-
-# Selection of samples normalized together ----
-
-# Analysis with edgeR ----
-counts_df<-as.data.frame(counts_dt[,-"id"])
-rownames(counts_df)<-counts_dt$id
-edge_c <- DGEList(counts=counts_df,group=c_anno_sele$cond_sele,samples=c_anno_sele,genes=r_anno)
-edge_n <- calcNormFactors(edge_c,method="TMM") # TMM method 
-# define multiplicative normalization factors and create cpm-rpkm table
-norm_factors<-mean(edge_n$samples$lib.size*edge_n$samples$norm.factors)/(edge_n$samples$lib.size*edge_n$samples$norm.factors) #check script Yale>Github>Ycode>vignettes>CFTRnotebook for the explanation<; if we divide each corrected library size for the mean of the corrected library sizes it's a dividing normalization = libraries are divided for that factor so the normalization factor is higher for libraries with an higher risk of over-regulation; if we multiply the mean of the corrected library sizes for each corrected library size it's a multiplicative normalization = libraries are multiplied for that factor so the normalization factor is higher for libraries with an higher risk of down-regulation
-names(norm_factors)<-edge_n$samples$sample
-norm_factors
-
-design <- model.matrix(~0+group, data=edge_c$samples) #binary matrix to pair replicates (description of the conditions)
-colnames(design)<-levels(edge_c$samples$group)
-rownames(design)<-edge_c$samples$sample
-
-edge_d <- estimateDisp(edge_n,design,robust=F) # robust=T ?
-#ESTIMATE THE DISPERSION = the biological variance of the genes considering the variability of a specific gene within the replicates and compared to other genes with similar expression level
-#plotBCV(edge_d)
-edge_f <- glmQLFit(edge_d,design,robust=F) # robust=T ?
-#squeeze of the variance -> estimation of the quasi-likelihood (QL) dispersions around the dispersion trend (calculated with estimateDisp above). It provides more robust and reliable error rate control when the number of replicates is small. High variability means that the QL dispersions are not squeezed very heavily from the raw values.
-#plotQLDisp(edge_f)
-
-```
-
-```{r cpm_tables, echo=FALSE, message=F}
-#we don't consider the length of the gene because we are not comparing 2 different genes in the same sample but the same gene in 2 different samples AND the rpkm (normalization for depth and then for length)/tpm (normalization for length and then for depth so each sample has the same size and you can really compare different samples) is an approximation at a gene level because there could be a lot of transcripts with different length and the normalization is usually for the average length of all the transcripts (if you want to quantify the expression of each transcript, these methods are ok)
-
-cpm_table<-as.data.frame(cpm(edge_n,log=F))
-cpm_table_dt<-as.data.table(cpm_table)[,id:=rownames(cpm_table)]
-# cpm_table_dt<-as.data.table(cpm_table)[,id:=rownames(rpkm_table)]
-
-l_cpm_table<-melt.data.table(cpm_table_dt, id.vars = c("id"),variable.name = "sample_sele",value.name = "cpm")
-
-setkey(l_cpm_table, sample_sele)
-l_cpm_table<-l_cpm_table[c_anno_sele, on = c(sample_sele="sample")]
-
-cpm_dt<-l_cpm_table[, .(N=.N,avg=mean(cpm),sd=sd(cpm)), .(cond_sele,id)][, se := sd/sqrt(N)]        
-
-cpm_avg<- dcast.data.table(cpm_dt[,c("id","cond_sele","avg")], id ~ cond_sele, value.var = "avg")
-colnames(cpm_avg)[-1]<-paste0(colnames(cpm_avg)[-1],"_cpm_avg")
-
-cpm_se<- dcast.data.table(cpm_dt[,c("id","cond_sele","se")], id ~ cond_sele, value.var = "se")
-colnames(cpm_se)[-1]<-paste0(colnames(cpm_se)[-1],"_cpm_se")
-
-setkey(cpm_avg, id)
-setkey(cpm_se, id)
-cpm_avgse<-cpm_avg[cpm_se, on = "id"]
-
-```
-
-### Clustering and MDS of samples with replicates (cpm)
-#### Clusterization is driven by the different fraction (heavy/light) rather than by the different genotype (WT/S34F/Q157R)
-
-```{r clustering replicates, fig.height=3, fig.width=5.5, echo=F, eval=F}
-
-### Dendogram
-
-mydata<-t(scale(t(cpm_table))) #t = transpose = reverse rows and columns -> t(df) because the scaling is according to the number of the columns so you need to put genes in the columns -> scale -> bring the matrix back to genes=rows/conditions=columns
-dd <- dist(t(mydata), method = "euclidean") #transpose again for the calculation of the distance matrix between sample1 and sample2 with euclidean method
-hc <- hclust(dd, method="ward.D") 
-cut <- as.data.frame(cutree(hc, k=6)) 
-colnames(cut) <- "cut"
-cut$names <- rownames(cut)
-cut<-cbind(cut,c_anno_sele[rownames(cut),])
-cut$cut<-as.numeric(as.factor(cut$cond_sele)) 
-
-library(ggdendro)
-
-hcdata <- dendro_data(hc, type="rectangle") 
-hcdata$labels <- left_join(hcdata$labels, cut, by=c("label"="names")) 
-
-tt<-ggplot(hcdata$segments) + 
-  geom_segment(aes(x = x, y = y, xend = xend, yend = yend))+
-  geom_text(data = hcdata$labels, aes(x, y, label = label, colour=factor(cut)), 
-            hjust = -0.2, size = 2.9, fontface = "bold") + 
-  scale_colour_manual(values=c(Q157R_color,S34F_color,WT_color,"#7282b4","#fca660","grey70")) +
-  labs(x="", y="") + coord_flip() + theme_dendro() + 
-  scale_y_reverse(expand = c(0.3, 0)) + theme(legend.position = "none")
-tt 
-
-```
-
-```{r clustering replicates_MDS, fig.height=3.5, fig.width=3.5, warning=FALSE, echo=FALSE, eval=F}
-
-### MDS
-
-mds_cmdscale <- as.data.frame(cmdscale(as.matrix(dd))) 
-mds_cmdscale$names <- rownames(mds_cmdscale)
-mds_cmdscale$cut <- cut$cut
-
-cmd<-ggplot(mds_cmdscale, aes(V1, V2, label=names)) +
-  geom_point(aes(colour=factor(cut)), size=2.3) +   
-  geom_text_repel(aes(colour=factor(cut)), size=3.1, fontface = "bold") + 
-  scale_colour_manual(values=c(Q157R_color,S34F_color,WT_color,"#7282b4","#fca660","grey70")) +
-  theme_bw(base_size = bs, base_family = bf) + 
-  theme(legend.position = "none",axis.title=element_blank(), panel.grid.minor=element_blank())
-cmd
-
-```
-
-### Clustering and MDS of samples collapsing replicates (cpm)
-
-```{r clustering conditions, fig.height=1.5, fig.width=7.5, echo=FALSE, eval=F}
-
-### Dendogram
-cpm_avg<-column_to_rownames(cpm_avg, var = "id")
-mydata<-t(scale(t(cpm_avg))) 
-#colnames(mydata)<-str_c(str_split(colnames(mydata),"_",simplify = T)[,1],str_split(colnames(mydata),"_",simplify = T)[,2],sep="_")
-dd <- dist(t(mydata), method = "euclidean") 
-hc <- hclust(dd, method="ward.D") 
-cut <- as.data.frame(cutree(hc, k=5)) 
-colnames(cut) <- "cut"
-cut$names <- rownames(cut)
-cut$cut<-as.numeric(as.factor(cut$names)) 
-
-library(ggdendro)
-
-hcdata <- dendro_data(hc, type="rectangle") 
-hcdata$labels <- left_join(hcdata$labels, cut, by=c("label"="names")) 
-
-tt<-ggplot(hcdata$segments) + 
-  geom_segment(aes(x = x, y = y, xend = xend, yend = yend))+
-  geom_text(data = hcdata$labels, aes(x, y, label = label, colour=factor(cut)), 
-            hjust = -0.2, size = 2.9, fontface = "bold") + 
-  scale_colour_manual(values=c(Q157R_color,S34F_color,WT_color,"#7282b4","#fca660","grey70")) +
-  coord_flip() + theme_dendro() + theme(axis.title.x = element_blank(),axis.title.y = element_blank()) + scale_y_reverse(expand = c(0.3, 0)) + theme(legend.position = "none")
-#tt 
-
-```
-
-```{r clustering conditions_MDS, fig.height=3, fig.width=3, echo=FALSE, eval=F}
-
-### MDS
-
-mds_cmdscale <- as.data.frame(cmdscale(as.matrix(dd))) 
-mds_cmdscale$names <- rownames(mds_cmdscale)
-mds_cmdscale$cut <- cut$cut
-
-cmd<-ggplot(mds_cmdscale, aes(V1, V2, label=names)) +
-  geom_point(aes(colour=factor(cut)), size=2.3) +   
-  geom_text_repel(aes(colour=factor(cut)), size=3.1, fontface = "bold") + 
-  scale_colour_manual(values=c(Q157R_color,S34F_color,WT_color,"#7282b4","#fca660","grey70")) +
-  theme_bw(base_size = bs, base_family = bf) + 
-  theme(legend.position = "none",axis.title=element_blank(), panel.grid.minor=element_blank())
-cmd
-
-```
-
-```{r write tables diff binding, echo=FALSE}
-
-gene_dt_slim <- unique(exon_anno_dt[gene_biotype=="protein_coding"][,c("coord","external_gene_name")])
-
-# S34F analysis
-
-contro_label <- "(light_S34F-light_WT)-(heavy_S34F-heavy_WT)"
-contro <- makeContrasts(contro_label, levels=design) #makeContrast to construct the contrast matrix (1 vs -1, the other conditions are 0) based on design (binary matrix to pair replicates)
-DEGs_s34f<-edgeRglmQLF(mat=edge_f, cpm_mat=edge_n, contro=contro, label="S34FvWT_LvH", sig_thr=1, sig_col="CPM", fc_thr=0.75, pval_thr=0.05, pval_col="p_val",names=T) #edgeRglmQLF is a Toma's function in cuff_process.R based on an edgeR function that calcualtes the log2_FC
-names(DEGs_s34f)[1]<- "eventID"
-names(DEGs_s34f)[4]<- "Pval_S34FvWT_LvH"
-names(DEGs_s34f)[5]<- "FDR_S34FvWT_LvH"
-summary(DEGs_s34f[,6])
-DEGs_s34f<-as.data.table(DEGs_s34f)
-
-setkey(DEGs_s34f,eventID)
-setkey(gene_dt_slim,coord)
-DEGs_s34f <- DEGs_s34f[gene_dt_slim,on = c("eventID"="coord")]
-
-DEGs_s34f <- DEGs_s34f %>% select(external_gene_name, everything())
-names(DEGs_s34f)[1]<- "geneSymbol"
-
-contro_label <- "light_S34F-light_WT"
-contro_l <- makeContrasts(contro_label, levels=design)
-DEGs_s34f_l<-edgeRglmQLF(mat=edge_f, cpm_mat=edge_n, contro=contro_l, label="S34FvWT_LvL", sig_thr=1, sig_col="CPM", fc_thr=0.75, pval_thr=0.05, pval_col="p_val",names=T)
-names(DEGs_s34f_l)[1]<- "eventID"
-names(DEGs_s34f_l)[4]<- "Pval_S34FvWT_LvL"
-names(DEGs_s34f_l)[5]<- "FDR_S34FvWT_LvL"
-summary(DEGs_s34f_l[,6])
-DEGs_s34f_l<-as.data.table(DEGs_s34f_l)
-
-setkey(DEGs_s34f_l,eventID)
-DEGs_s34f <- DEGs_s34f[DEGs_s34f_l,on = "eventID"]
-
-contro_label <- "heavy_S34F-heavy_WT"
-contro_h <- makeContrasts(contro_label, levels=design)
-DEGs_s34f_h<-edgeRglmQLF(mat=edge_f, cpm_mat=edge_n, contro=contro_h, label="S34FvWT_HvH", sig_thr=1, sig_col="CPM", fc_thr=0.75, pval_thr=0.05, pval_col="p_val",names=T)
-names(DEGs_s34f_h)[1]<- "eventID"
-names(DEGs_s34f_h)[4]<- "Pval_S34FvWT_HvH"
-names(DEGs_s34f_h)[5]<- "FDR_S34FvWT_HvH"
-summary(DEGs_s34f_h[,6])
-DEGs_s34f_h<-as.data.table(DEGs_s34f_h)
-
-setkey(DEGs_s34f_h,eventID)
-DEGs_s34f <- DEGs_s34f[DEGs_s34f_h,on = "eventID"]
-
-# S34F vs WT HAS MORE U2AF1
-
-# Q157R analysis
-
-contro_label <- "(light_Q157R-light_WT)-(heavy_Q157R-heavy_WT)"
-contro <- makeContrasts(contro_label, levels=design) #makeContrast to construct the contrast matrix (1 vs -1, the other conditions are 0) based on design (binary matrix to pair replicates)
-DEGs_q157r<-edgeRglmQLF(mat=edge_f, cpm_mat=edge_n, contro=contro, label="Q157RvWT_LvH", sig_thr=1, sig_col="CPM", fc_thr=0.75, pval_thr=0.05, pval_col="p_val",names=T) #edgeRglmQLF is a Toma's function in cuff_process.R based on an edgeR function that calcualtes the log2_FC
-names(DEGs_q157r)[1]<- "eventID"
-names(DEGs_q157r)[4]<- "Pval_Q157RvWT_LvH"
-names(DEGs_q157r)[5]<- "FDR_Q157RvWT_LvH"
-summary(DEGs_q157r[,6])
-DEGs_q157r<-as.data.table(DEGs_q157r)
-
-setkey(DEGs_q157r,eventID)
-DEGs_q157r <- DEGs_q157r[gene_dt_slim,on = c("eventID"="coord")]
-
-DEGs_q157r <- DEGs_q157r %>% select(external_gene_name, everything())
-names(DEGs_q157r)[1]<- "geneSymbol"
-
-contro_label <- "light_Q157R-light_WT"
-contro_l <- makeContrasts(contro_label, levels=design)
-DEGs_q157r_l<-edgeRglmQLF(mat=edge_f, cpm_mat=edge_n, contro=contro_l, label="Q157RvWT_LvL", sig_thr=1, sig_col="CPM", fc_thr=0.75, pval_thr=0.05, pval_col="p_val",names=T)
-names(DEGs_q157r_l)[1]<- "eventID"
-names(DEGs_q157r_l)[4]<- "Pval_Q157RvWT_LvL"
-names(DEGs_q157r_l)[5]<- "FDR_Q157RvWT_LvL"
-summary(DEGs_q157r_l[,6])
-DEGs_q157r_l<-as.data.table(DEGs_q157r_l)
-
-setkey(DEGs_q157r_l,eventID)
-DEGs_q157r <- DEGs_q157r[DEGs_q157r_l,on = "eventID"]
-
-contro_label <- "heavy_Q157R-heavy_WT"
-contro_h <- makeContrasts(contro_label, levels=design)
-DEGs_q157r_h<-edgeRglmQLF(mat=edge_f, cpm_mat=edge_n, contro=contro_h, label="Q157RvWT_HvH", sig_thr=1, sig_col="CPM", fc_thr=0.75, pval_thr=0.05, pval_col="p_val",names=T)
-names(DEGs_q157r_h)[1]<- "eventID"
-names(DEGs_q157r_h)[4]<- "Pval_Q157RvWT_HvH"
-names(DEGs_q157r_h)[5]<- "FDR_Q157RvWT_HvH"
-summary(DEGs_q157r_h[,6])
-DEGs_q157r_h<-as.data.table(DEGs_q157r_h)
-
-setkey(DEGs_q157r_h,eventID)
-DEGs_q157r <- DEGs_q157r[DEGs_q157r_h,on = "eventID"]
-
-# Q157R vs WT HAS LESS U2AF1 and the difference is bigger than in the S34F (4X less vs 2X more)
-#save(DEGs_s34f,DEGs_q157r, file="./data/DEGs_binding_fastuniq.RData")
-save(DEGs_s34f,DEGs_q157r,file="./data/DEGs_binding_u2af1_u2af2.RData")
-save(DEGs_s34f,DEGs_q157r,file="./data/DEGs_binding_u2af1_u2af2_DEF.RData") #this version was obtained filtering counts_df for coords present in alluvial_pre_df after Toma filter keeping only binding events in EXPRESSED genes (to match eCLIP-seq and RNA-seq). I used this version for DB venn and functional analysis while we keep the old DEGs in "DEGs_binding_u2af1_u2af2" for all the other splicing-binding analysis since there are no differences (except the Q157R SE 68558566_68558679_chr11_+ in the phosphatase PPP6R3)
-
-```
-
-
-### Profiles for single junctions (scatter plots rnaseq-eclip) - S34F vs WT
-
-```{r,fig.height=8,fig.width=4,echo=FALSE,message=FALSE,warning=FALSE}
-
-#load(file="./data/TL_exon_spec.RData") # df_rnaseq_s34f, df_rnaseq_q157r, df_tlseq_s34f, df_tlseq_q157r, df_s34f_sig_u_rnaseq, df_q157r_sig_u_rnaseq, df_s34f_sig_u_tl, df_q157r_sig_u_tl, rmats_correct, bed ##sig_u are the events in the scatter plots
-
-load("./data/as_db_u2af1_u2af2_dt.Rdata") # dt_s34f_sig_u_rnaseq, dt_q157r_sig_u_rnaseq after selection of u2af1 and u2af2 windows
-
-inc_more <- dt_s34f_sig_u_rnaseq[type=="SE" & comb_class=="inclusion;more_U2AF1"]$eventID
-
-inc_less <- dt_s34f_sig_u_rnaseq[type=="SE" & comb_class=="inclusion;less_U2AF1"]$eventID
-
-exc_more <- dt_s34f_sig_u_rnaseq[type=="SE" & comb_class=="exclusion;more_U2AF1"]$eventID
-
-exc_less <- dt_s34f_sig_u_rnaseq[type=="SE" & comb_class=="exclusion;less_U2AF1"]$eventID
-
-ret_more <- dt_s34f_sig_u_rnaseq[type=="RI" & comb_class=="inclusion;more_U2AF1"]$eventID
-
-ret_less <- dt_s34f_sig_u_rnaseq[type=="RI" & comb_class=="inclusion;less_U2AF1"]$eventID
-
-junc_sele <- exon_anno_dt[exon_class %in% c("I") & transcript_biotype%in%c("protein_coding") & coord %in% inc_less][order(id)]
-junc_sele <- junc_sele[!duplicated(coord),] #we remove duplicated coordinates but before we arranged according to the transcript name so we are keeping coordinates from canonical isoforms plus possible different coordinates from non-canonical isoform
-
-for(j in c(1:nrow(junc_sele))){ #j is the number of the row
-#j=1 
-coord_id <-junc_sele[j,coord]
-#coord_id <- "35662946_35663074_chr9_-"
-
-title_name <- paste0(junc_sele[j,"external_transcript_name"],"; exon ",
-                     junc_sele[j,"rank"], "; ",
-                     junc_sele[j,"chromosome_ucsc"], ":",
-                     junc_sele[j,"exon_chrom_start"], "-",
-                     junc_sele[j,"exon_chrom_end"], 
-                     junc_sele[j,"strand_ucsc"])
-
-save_name <- paste0(junc_sele[j,"id"],"_",
-                    junc_sele[j,"exon_chrom_start"], "-",
-                    junc_sele[j,"exon_chrom_end"])
-
-out3<-jCov(input_list=x3_list_dt,
-           junction_vec=coord_id,
-           name="single")
-
-out3 <- out3[c_anno, on="sample"]
-
-out3 <- out3[clip_lib_size_norm, on="sample"]
-
-#consider each SINGLE SAMPLE and calculate the total signal from all the positions and the percentage of the signal for each position 
-out3<-out3[, c("tot_trim","tot_all"):=list(sum(sum_trim), sum(sum_all)), by= c("sample","jclass")][,signal_perc_trim:=(as.numeric(sum_trim)/as.numeric(tot_trim))*100][,signal_perc_all:= (as.numeric(sum_all)/as.numeric(tot_all))*100][,signal_per_million:= (as.numeric(sum_all)/as.numeric(libr_size))*1000000]
-                                                                                  
-#signal per million has to be built on sum_all, not sum_trim as for metaprofiles because there is no sense to do the trimming (removal of outliers) when we are considering only one junction
-
-sample_dt <- out3[protein%in%c("U2AF1","U2AF2") &
-                  #protein%in%c("U2AF1") &
-                  #genotype%in%c("WT","S34F","Q157R") & 
-                  genotype%in%c("WT","S34F") &
-                  #treatment %in% c("dox","noinf") & 
-                  treatment %in% c("dox") &
-                  fraction %in% c("heavy","light","whole") & 
-                  #fraction %in% c("heavy","light") & 
-                  library %in% c("clip") &
-                  position%in%seq(-20,2)]
-
-sample_dt<-sample_dt[,wrapper:=paste(protein,treatment,fraction)][, wrapper:=factor(wrapper,levels=c("U2AF1 dox light","U2AF1 dox heavy","U2AF1 dox whole","U2AF2 dox light"))]
-
-
-list_dt <- jBuild(sample_dt)
-cond_dt <- list_dt$cond_dt
-delta_dt <- list_dt$delta_dt
-
-point_dt <- cond_dt[point_validation==TRUE]
-delta_point_dt<-delta_dt[p.value_1tail<0.05]
-
-if(all(cond_dt$plot_validation)){ #all prints TRUE only if all the conditions are TRUE
-  
-j_seq_dt <-data.table("position"=c(seq(-20,-1),seq(1,2)), "nucleotide"=str_split(as.character(subseq(inex_RNA[coord_id],21,42)),"")[[1]], "n_col"="grey30", stringsAsFactors = FALSE)
-
-j_seq_dt[which(j_seq_dt$nucleotide=="U"),"n_col"]<- U_color
-j_seq_dt[which(j_seq_dt$nucleotide=="A"),"n_col"]<- A_color
-j_seq_dt[which(j_seq_dt$nucleotide=="C"),"n_col"]<- C_color
-j_seq_dt[which(j_seq_dt$nucleotide=="G"),"n_col"]<- G_color
-
-j_seq_dt <- unique(cond_dt[,c("position","wrapper","plot_roof")])[j_seq_dt, on=c("position")]
-
-j_seq_dt[,treatment:= "dox"] #geom_text needs also a column named genotype because geom_text is inserted within the ggplot functions where there are position, mean and genotype; we don't have diff sequence for the different conditions so we just take the WT
-
-#j_seq_dt[,genotype:="WT"] #for plot comparing genotypes
-
-numbers <- cpm_dt[id==coord_id & cond_sele %in% c("heavy_S34F","heavy_WT","light_S34F","light_WT")][,c("cond_sele","avg")]
-numbers$wrapper <- NULL
-numbers[which(numbers$cond_sele %in% c("heavy_S34F","heavy_WT")),"wrapper"] <- "U2AF1 dox heavy"
-numbers[which(numbers$cond_sele %in% c("light_S34F","light_WT")),"wrapper"] <- "U2AF1 dox light"
-numbers$cpm_avg <- NULL
-numbers[which(numbers$wrapper=="U2AF1 dox heavy"),"cpm_avg"] <- paste0("CPM S34F=",round(numbers[which(numbers$cond_sele=="heavy_S34F"),"avg"]),"; ","CPM WT=", round(numbers[which(numbers$cond_sele=="heavy_WT"),"avg"]))
-numbers[which(numbers$wrapper=="U2AF1 dox light"),"cpm_avg"] <- paste0("CPM S34F=",round(numbers[which(numbers$cond_sele=="light_S34F"),"avg"]),"; ","CPM WT=", round(numbers[which(numbers$cond_sele=="light_WT"),"avg"]))
-numbers <- numbers %>% select (wrapper,cpm_avg) %>% unique()
-numbers <- rbind(as.tibble(numbers),c("U2AF1 dox whole",""),c("U2AF2 dox light",""))
-numbers$treatment <- "dox"
-#numbers$genotype <- "WT" #for plot comparing genotypes
-numbers$wrapper <- factor(numbers$wrapper, levels = c("U2AF1 dox light","U2AF1 dox heavy","U2AF1 dox whole","U2AF2 dox light"))
-
-# Plot delta between genotypes ---
-bs<-11
-ex<-ggplot(delta_dt,aes(position,delta_mean,col=treatment,fill=treatment)) +
-    geom_vline(xintercept=0,linetype=2,colour="grey20",alpha=0.8) +
-    #facet_grid(genexp ~ jclass,scales = "free") + #facet_grid splits up data by one or two variables that vary on the horizontal and/or vertical direction
-    facet_wrap(~ wrapper,ncol=1,scales = "free_y") + #instead of faceting with a variable in the horizontal or vertical direction, facets can be placed next to each other, wrapping with a certain number of columns or rows. The label for each plot will be at the top of the plot.
-    geom_ribbon(aes(ymin=delta_mean-delta_se,ymax=delta_mean+delta_se),alpha=0.2,colour=NA)+
-    geom_line(alpha=0.8) +
-    geom_point(data=delta_point_dt, alpha=0.9, size=bs*0.12) +
-    theme_bw(base_size = bs,base_family = bf)+
-    scale_colour_manual(name="treatment", values="#c95b03") +
-    scale_fill_manual(name="treatment", values="#c95b03") +
-    scale_x_continuous(breaks=c(seq(-100,-5,5),seq(1,2,2)))+ #a tick mark is shown on every 5, in the intron (-) and in the exon (+); -100 + 100 even if our considered interval is -40 +10
-    #scale_y_continuous(breaks=seq(0,1,0.02))+
-    #theme(legend.justification=c(0.01,0.99), legend.position=c(0.01,0.99)) +
-    theme(plot.title = element_text(hjust = 0.5,size=0.9*bs))+
-    theme(legend.text = element_text(size = 0.5*bs),
-    legend.key.size = unit((0.012*bs),"in"))+
-    theme(legend.position = "none")+
-    #theme(legend.title = element_blank())+
-    #theme(legend.box = "horizontal")+
-    theme(panel.grid.minor = element_blank())+
-    theme(strip.text.x = element_text(size = 1.1*bs))+
-    labs(x="distance from junction (nt)",y="X-link per mln",title=title_name)+
-    geom_text(data=j_seq_dt, aes(y=-Inf, label=nucleotide, vjust=-0.5), colour=j_seq_dt$n_col)
-
-ex <- ex + geom_text(data=numbers, aes(label = cpm_avg, x=-Inf, y=+Inf, hjust=-0.05, vjust=1.5), size=0.25*bs, colour="black",alpha=1,fontface="italic")
-
-ex
-
-ggsave(paste0("./figures/",save_name,".pdf"),ex,device=cairo_pdf,width = 5, height = 8.5 , units = c("in"))
-}
-}
-
-```
-
-### Profiles for single junctions (scatter plots rnaseq-eclip) - Q157R vs WT
-
-```{r,fig.height=8,fig.width=4,echo=FALSE,message=FALSE,warning=FALSE}
-
-#load(file="./data/TL_exon_spec.RData") # df_rnaseq_s34f, df_rnaseq_q157r, df_tlseq_s34f, df_tlseq_q157r, df_s34f_sig_u_rnaseq, df_q157r_sig_u_rnaseq, df_s34f_sig_u_tl, df_q157r_sig_u_tl, rmats_correct, bed ##sig_u are the events in the scatter plots
-
-load("./data/as_db_u2af1_u2af2_dt.Rdata") # dt_s34f_sig_u_rnaseq, dt_q157r_sig_u_rnaseq after selection of u2af1 and u2af2 windows
-
-inc_more <- df_q157r_sig_u_rnaseq[type=="SE" & comb_class=="inclusion;more_U2AF1"]$eventID
-
-inc_less <- df_q157r_sig_u_rnaseq[type=="SE" & comb_class=="inclusion;less_U2AF1"]$eventID
-
-exc_more <- df_q157r_sig_u_rnaseq[type=="SE" & comb_class=="exclusion;more_U2AF1"]$eventID
-
-exc_less <- df_q157r_sig_u_rnaseq[type=="SE" & comb_class=="exclusion;less_U2AF1"]$eventID
-
-ret_more <- df_q157r_sig_u_rnaseq[type=="RI" & comb_class=="inclusion;more_U2AF1"]$eventID
-
-ret_less <- df_q157r_sig_u_rnaseq[type=="RI" & comb_class=="inclusion;less_U2AF1"]$eventID
-
-
-junc_sele <- exon_anno_dt[exon_class %in% c("I") & transcript_biotype%in%c("protein_coding") & coord %in% inc_more][order(id)]
-
-junc_sele <- junc_sele[!duplicated(coord),] #we remove duplicated coordinates but before we arranged according to the transcript name so we are keeping coordinates from canonical isoforms plus possible different coordinates from non-canonical isoform
-
-for(j in c(1:nrow(junc_sele))){ #j is the number of the row
-#j=1 
-coord_id <-junc_sele[j,coord]
-#coord_id <- "48242540_48242644_chr19_-"
-
-title_name <- paste0(junc_sele[j,"external_transcript_name"],"; exon ",
-                     junc_sele[j,"rank"], "; ",
-                     junc_sele[j,"chromosome_ucsc"], ":",
-                     junc_sele[j,"exon_chrom_start"], "-",
-                     junc_sele[j,"exon_chrom_end"], 
-                     junc_sele[j,"strand_ucsc"])
-
-save_name <- paste0(junc_sele[j,"id"],"_",
-                    junc_sele[j,"exon_chrom_start"], "-",
-                    junc_sele[j,"exon_chrom_end"])
-
-out3<-jCov(input_list=x3_list_dt,
-           junction_vec=coord_id,
-           name="single")
-
-out3 <- out3[c_anno, on="sample"]
-
-out3 <- out3[clip_lib_size_norm, on="sample"]
-
-  #consider each SINGLE SAMPLE and calculate the total signal from all the positions and the percentage of the signal for each position 
-
-out3<-out3[, c("tot_trim","tot_all"):=list(sum(sum_trim), sum(sum_all)), by= c("sample","jclass")][,signal_perc_trim:=(as.numeric(sum_trim)/as.numeric(tot_trim))*100][,signal_perc_all:= (as.numeric(sum_all)/as.numeric(tot_all))*100][,signal_per_million:= (as.numeric(sum_all)/as.numeric(libr_size))*1000000]
-
-#signal per million has to be built on sum_all, not sum_trim as for metaprofiles because there is no sense to do the trimming (removal of outliers) when we are considering only one junction
-
-sample_dt <- out3[protein%in%c("U2AF1","U2AF2") &
-                      #protein%in%c("U2AF1") &
-                      #genotype%in%c("WT","S34F","Q157R") & 
-                      genotype%in%c("WT","Q157R") &
-                      #treatment %in% c("dox","noinf") & 
-                      treatment %in% c("dox") &
-                      fraction %in% c("heavy","light","whole") & 
-                      #fraction %in% c("heavy","light") & 
-                      library %in% c("clip") &
-                      position%in%seq(-20,2)]
-
-sample_dt<-sample_dt[,wrapper:=paste(protein,treatment,fraction)][, wrapper:=factor(wrapper,levels=c("U2AF1 dox light","U2AF1 dox heavy","U2AF1 dox whole","U2AF2 dox light"))]
-
-list_dt <- jBuild(sample_dt)
-cond_dt <- list_dt$cond_dt
-delta_dt <- list_dt$delta_dt
-
-point_dt <- cond_dt[point_validation==TRUE]
-delta_point_dt<-delta_dt[p.value_1tail<0.05]
-
-if(any(cond_dt$plot_validation)){ #all prints TRUE only if all the conditions are TRUE
-
-j_seq_dt <-data.table("position"=c(seq(-20,-1),seq(1,2)), "nucleotide"=str_split(as.character(subseq(inex_RNA[coord_id],21,42)),"")[[1]], "n_col"="grey30", stringsAsFactors = FALSE)
-
-j_seq_dt[which(j_seq_dt$nucleotide=="U"),"n_col"]<- U_color
-j_seq_dt[which(j_seq_dt$nucleotide=="A"),"n_col"]<- A_color
-j_seq_dt[which(j_seq_dt$nucleotide=="C"),"n_col"]<- C_color
-j_seq_dt[which(j_seq_dt$nucleotide=="G"),"n_col"]<- G_color
-
-j_seq_dt <- unique(cond_dt[,c("position","wrapper","plot_roof")])[j_seq_dt, on=c("position")]
-
-j_seq_dt[,treatment:= "dox"] #geom_text needs also a column named genotype because geom_text is inserted within the ggplot functions where there are position, mean and genotype; we don't have diff sequence for the different conditions so we just take the WT
-
-#j_seq_dt[,genotype:="WT"] #for plot comparing genotypes
-
-numbers <- cpm_dt[id==coord_id & cond_sele %in% c("heavy_S34F","heavy_WT","light_S34F","light_WT")][,c("cond_sele","avg")]
-numbers$wrapper <- NULL
-numbers[which(numbers$cond_sele %in% c("heavy_Q157R","heavy_WT")),"wrapper"] <- "U2AF1 dox heavy"
-numbers[which(numbers$cond_sele %in% c("light_Q157R","light_WT")),"wrapper"] <- "U2AF1 dox light"
-numbers$cpm_avg <- NULL
-numbers[which(numbers$wrapper=="U2AF1 dox heavy"),"cpm_avg"] <- paste0("CPM Q157R=",round(numbers[which(numbers$cond_sele=="heavy_Q157R"),"avg"]),"; ","CPM WT=", round(numbers[which(numbers$cond_sele=="heavy_WT"),"avg"]))
-numbers[which(numbers$wrapper=="U2AF1 dox light"),"cpm_avg"] <- paste0("CPM Q157R=",round(numbers[which(numbers$cond_sele=="light_Q157R"),"avg"]),"; ","CPM WT=", round(numbers[which(numbers$cond_sele=="light_WT"),"avg"]))
-numbers <- numbers %>% select (wrapper,cpm_avg) %>% unique()
-numbers <- rbind(as_tibble(numbers),c("U2AF1 dox whole",""),c("U2AF2 dox light",""))
-numbers$treatment <- "dox"
-#numbers$genotype <- "WT" #for plot comparing genotypes
-numbers$wrapper <- factor(numbers$wrapper, levels = c("U2AF1 dox light","U2AF1 dox heavy","U2AF1 dox whole","U2AF2 dox light"))
-
-# Plot delta between genotypes ---
-bs<-11
-ex<-ggplot(delta_dt,aes(position,delta_mean,col=treatment,fill=treatment)) +
-    geom_vline(xintercept=0,linetype=2,colour="grey20",alpha=0.8) +
-    #facet_grid(genexp ~ jclass,scales = "free") + #facet_grid splits up data by one or two variables that vary on the horizontal and/or vertical direction
-    facet_wrap(~ wrapper,ncol=1,scales = "free_y") + #instead of faceting with a variable in the horizontal or vertical direction, facets can be placed next to each other, wrapping with a certain number of columns or rows. The label for each plot will be at the top of the plot.
-    geom_ribbon(aes(ymin=delta_mean-delta_se,ymax=delta_mean+delta_se),alpha=0.2,colour=NA)+
-    geom_line(alpha=0.8) +
-    geom_point(data=delta_point_dt, alpha=0.9, size=bs*0.12) +
-    theme_bw(base_size = bs,base_family = bf)+
-    scale_colour_manual(name="treatment", values=cQ157R_color) +
-    scale_fill_manual(name="treatment", values=cQ157R_color) +
-    scale_x_continuous(breaks=c(seq(-100,-5,5),seq(1,2,2)))+ #a tick mark is shown on every 5, in the intron (-) and in the exon (+); -100 + 100 even if our considered interval is -40 +10
-    #scale_y_continuous(breaks=seq(0,1,0.02))+
-    #theme(legend.justification=c(0.01,0.99), legend.position=c(0.01,0.99)) +
-    theme(plot.title = element_text(hjust = 0.5,size=0.9*bs))+
-    theme(legend.text = element_text(size = 0.5*bs),
-    legend.key.size = unit((0.012*bs),"in"))+
-    theme(legend.position = "none")+
-    #theme(legend.title = element_blank())+
-    #theme(legend.box = "horizontal")+
-    theme(panel.grid.minor = element_blank())+
-    theme(strip.text.x = element_text(size = 1.1*bs))+
-    labs(x="distance from junction (nt)",y="X-link per mln",title=title_name)+
-    geom_text(data=j_seq_dt, aes(y=-Inf, label=nucleotide, vjust=-0.5), colour=j_seq_dt$n_col)
-
-ex <- ex + geom_text(data=numbers, aes(label = cpm_avg, x=-Inf, y=+Inf, hjust=-0.05, vjust=1.5), size=0.25*bs, colour="black",alpha=1,fontface="italic")
-
-ex
-
-ggsave(paste0("./figures/",save_name,".pdf"),ex,device=cairo_pdf,width = 5, height = 8.5 , units = c("in"))
-}
-}
-
-```
-
-```{r, echo=FALSE}
-# Plot comparing genotypes ----
-
-cond_dt[,genotype:=factor(genotype,levels=c("WT","Q157R"))]
-bs<-11
-ex<-ggplot(cond_dt,aes(position,mean,col=genotype,fill=genotype)) +
-    geom_vline(xintercept=0,linetype=2,colour="grey20",alpha=0.8) +
-    #facet_grid(genexp ~ jclass,scales = "free") + #facet_grid splits up data by one or two variables that vary on the horizontal and/or vertical direction
-    facet_wrap(~ wrapper,ncol=1,scales = "free_y") + #instead of faceting with a variable in the horizontal or vertical direction, facets can be placed next to each other, wrapping with a certain number of columns or rows. The label for each plot will be at the top of the plot.
-    geom_ribbon(aes(ymin=mean-se,ymax=mean+se),alpha=0.2,colour=NA)+
-    geom_line(alpha=0.8) +
-    geom_point(data=point_dt, alpha=0.9, size=bs*0.12) +
-    theme_bw(base_size = bs,base_family = bf)+
-    scale_colour_manual(name="genotype", values=c(WT_color,Q157R_color)) +
-    scale_fill_manual(name="genotype", values=c(WT_color,Q157R_color)) +
-    scale_x_continuous(breaks=c(seq(-100,-5,5),seq(1,2,2)))+ #a tick mark is shown on every 5, in the intron (-) and in the exon (+); -100 + 100 even if our considered interval is -40 +10
-    #scale_y_continuous(breaks=seq(0,1,0.02))+
-    #theme(legend.justification=c(0.01,0.99), legend.position=c(0.01,0.99)) +
-    theme(plot.title = element_text(hjust = 0.5,size=0.9*bs))+
-    theme(legend.text = element_text(size = 0.5*bs),
-    legend.key.size = unit((0.012*bs),"in"))+
-    #theme(legend.position = "none")+
-    theme(legend.title = element_blank())+
-    theme(legend.box = "horizontal")+
-    theme(panel.grid.minor = element_blank())+
-    theme(strip.text.x = element_text(size = 1.1*bs))+
-    labs(x="distance from junction (nt)",y="X-link per mln",title=title_name)+
-    geom_text(data=j_seq_dt, aes(y=-(plot_roof/10), label=nucleotide),colour=j_seq_dt$n_col)
-
-ex <- ex + geom_text(data=numbers, aes(label = cpm_avg, x=-Inf, y=+Inf, hjust=-0.05, vjust=1.5), size=0.25*bs, colour="black",alpha=1,fontface="italic")
-
-
-#ggsave(paste0("./results/figures/",save_name,".pdf"),ex,device=cairo_pdf,width = 5, height = 8.5 , units = c("in"))
-
-```
-
-### Profile of a known single junction 
-
-```{r,fig.height=2.5,fig.width=6,echo=FALSE,message=FALSE,warning=FALSE}
-
-#coord_id <- "32737865_32737942_chr12_+" #DNM1L-203;exon 16; S34F_lessINC_lessBIN
-#coord_id <- "150842424_150842468_chr1_-" #ARNT-201; exon 5; S34F_lessINC_moreBIN
-#coord_id <- "136663408_136663623_chr9_+" #EGFL7-201; exon 2; S34F_moreINC_lessBIN
-#coord_id <- "87155455_87155497_chr7_+" #DMTF1-212; exon 3; S34F_moreINC_moreBIN
-coord_id <- "35031267_35031337_chr1_-" #ZMYM6-203; exon 2; S34F_moreINC_moreBIN no u2af2 signal in the light fraction
-
-#coord_id <- "96619672_96619762_chr2_+" #KANSL3-206; exon 4; example of less binding
-
-out3<-jCov(input_list=x3_list_dt,
-           junction_vec=coord_id,
-           name="single")
-
-out3 <- out3[c_anno, on="sample"]
-out3 <- out3[clip_lib_size_norm, on="sample"]
-
-#consider each SINGLE SAMPLE and calculate the total signal from all the positions and the percentage of the signal for each position 
-out3<-out3[, c("tot_trim","tot_all"):=list(sum(sum_trim), sum(sum_all)), by= c("sample","jclass")][,signal_perc_trim:=(as.numeric(sum_trim)/as.numeric(tot_trim))*100][,signal_perc_all:= (as.numeric(sum_all)/as.numeric(tot_all))*100][,signal_per_million:= (as.numeric(sum_all)/as.numeric(libr_size))*1000000]
-
-#signal per million has to be built on sum_all, not sum_trim as for metaprofiles because there is no sense to do the trimming (removal of outliers) when we are considering only one junction
-
-sample_dt <- out3[protein%in%c("U2AF1","U2AF2") &
-                      #protein%in%c("U2AF1") &
-                      #genotype%in%c("WT","S34F","Q157R") & 
-                      genotype%in%c("WT","S34F") &
-                      #treatment %in% c("dox","noinf") & 
-                      treatment %in% c("dox") &
-                      #fraction %in% c("heavy","light","whole") & 
-                      fraction %in% c("heavy","light") & 
-                      library %in% c("clip") &
-                      position%in%seq(-20,2)]
-
-sample_dt<-sample_dt[,wrapper:=paste(protein,treatment,fraction)]
-
-sample_dt[which(sample_dt$wrapper=="U2AF1 dox heavy"),"wrapper"] <- "Heavy Fraction (U2AF1+U2AF2)"
-sample_dt[which(sample_dt$wrapper=="U2AF1 dox light"),"wrapper"] <- "Light Fraction (U2AF1)"
-
-list_dt <- jBuild(sample_dt)
-cond_dt <- list_dt$cond_dt
-cond_dt[,genotype:=factor(genotype,levels=c("WT","S34F"))]
-#delta_dt <- list_dt$delta_dt
-point_dt <- cond_dt[point_validation==TRUE]
-#delta_point_dt <- delta_dt[p.value_1tail<0.05]
-
-j_seq_dt <-data.table("position"=c(seq(-20,-1),seq(1,2)), "nucleotide"=str_split(as.character(subseq(inex_RNA[coord_id],21,42)),"")[[1]], "n_col"="grey30", stringsAsFactors = FALSE)
-
-j_seq_dt[which(j_seq_dt$nucleotide=="U"),"n_col"]<- U_color
-j_seq_dt[which(j_seq_dt$nucleotide=="A"),"n_col"]<- A_color
-j_seq_dt[which(j_seq_dt$nucleotide=="C"),"n_col"]<- C_color
-j_seq_dt[which(j_seq_dt$nucleotide=="G"),"n_col"]<- G_color
-
-j_seq_dt <- unique(cond_dt[,c("position","wrapper","plot_roof")])[j_seq_dt, on=c("position")]
-
-# j_seq_dt[,treatment:= "dox"] #geom_text needs also a column named genotype because geom_text is inserted within the ggplot functions where there are position, mean and genotype; we don't have diff sequence for the different conditions so we just take the WT
-
-j_seq_dt[,genotype:="WT"] #for plot comparing genotypes
-
-# Plot delta between genotypes ---
-bs<-11
-ex<-ggplot(cond_dt,aes(position,mean,col=genotype,fill=genotype)) +
-    geom_vline(xintercept=0,linetype=2,colour="grey20",alpha=0.8) +
-    #facet_grid(genexp ~ jclass,scales = "free") + #facet_grid splits up data by one or two variables that vary on the horizontal and/or vertical direction
-    facet_wrap(~ wrapper,ncol=2,scales = "free_y") + #instead of faceting with a variable in the horizontal or vertical direction, facets can be placed next to each other, wrapping with a certain number of columns or rows. The label for each plot will be at the top of the plot.
-    geom_ribbon(aes(ymin=mean-se,ymax=mean+se),alpha=0.2,colour=NA)+
-    geom_line(alpha=0.8) +
-    geom_point(data=point_dt, alpha=0.9, size=bs*0.12) +
-    theme_bw(base_size = bs,base_family = bf)+
-    scale_colour_manual(name="genotype", values=c(WT_color,S34F_color)) +
-    scale_fill_manual(name="genotype", values=c(WT_color,S34F_color)) +
-    scale_x_continuous(breaks=c(seq(-100,-5,5),seq(1,2,2)))+ #a tick mark is shown on every 5, in the intron (-) and in the exon (+); -100 + 100 even if our considered interval is -40 +10
-    #scale_y_continuous(breaks=seq(0,1,0.02))+
-    theme(legend.justification=c(0.01,0.99), legend.position=c(0.01,0.99)) +
-    theme(plot.title = element_text(hjust = 0.5,size=bs,face="bold"))+
-    theme(legend.text = element_text(size = 0.6*bs),
-    legend.key.size = unit((0.012*bs),"in"))+
-    #theme(legend.position = "none")+
-    theme(legend.title = element_blank())+
-    theme(legend.box = "horizontal")+
-    theme(panel.grid.minor = element_blank())+
-    theme(strip.text.x = element_text(size = 1.1*bs))+
-    labs(x="distance from junction (nt)",y="X-link per mln",title="ZMYM6-203; exon 2; chr1:35031267-35031337-")+
-    geom_text(data=j_seq_dt, aes(y=-(plot_roof/10), label=nucleotide),colour=j_seq_dt$n_col)
-
-ex
-
-ggsave(paste0("./figures/ZMYM6-203;exon 2;chr1:35031267-35031337-.pdf"),ex,device=cairo_pdf,width = 7, height = 2.8, units = c("in"))
-
-```
-
-#### S34F vs Q157R: DB genes (class + and - together)
-
-```{r,echo=FALSE,message=FALSE,fig.height=4, fig.width=5}
-
-load("./data/DEGs_binding_u2af1_u2af2_DEF.RData")
-# DEGs_s34f,DEGs_q157r considering -20;-5 window for heavy fractions and -4;+2 window for light fractions
-
-### s34f_db_sig<-DEGs_s34f %>% filter(class_S34FvWT_LvH %in% c("+","-"))
-s34f_db_sig<-DEGs_s34f[class_S34FvWT_LvH %in% c("+","-")]
-s34f_db_gene_vec<-unique(s34f_db_sig[,"geneSymbol"])
-
-### q157r_db_sig<-DEGs_q157r %>% filter(class_Q157RvWT_LvH %in% c("+","-"))
-q157r_db_sig<-DEGs_q157r[class_Q157RvWT_LvH %in% c("+","-")]
-q157r_db_gene_vec<-unique(q157r_db_sig[,"geneSymbol"])
-
-### Intersection of genes
-#s34f_as_gene_vec<-as.character(s34f_as_gene_vec)
-#q157r_as_gene_vec<-as.character(q157r_as_gene_vec)
-
-library(VennDiagram)
-flog.threshold(ERROR)
-vennPlot = venn.diagram(list(S34F_DB=s34f_db_gene_vec,Q157R_DB=q157r_db_gene_vec),
-                        fill = c(S34F_color,Q157R_color),col="white", filename = NULL, lwd = 0.8,
-                        alpha = 0.8, fontface = "bold", cex = 1.5, label.col = "white",
-                        cat.cex = 1.6, cat.pos = c(-18,18), cat.fontface = "italic",
-                        cat.col = c(S34F_color,Q157R_color), inverted=TRUE)
-grid.newpage()
-grid.draw(vennPlot)
-ggsave("./figures/S34F_Q157R_db_venn.pdf",vennPlot,device="pdf",width = 2.5, height = 2, units = c("in")) #with arial font is not possible to save it
-#in case, for arial font, after upload extrafont, restart R, add cat.fontfamily = bf,fontfamily = bf to the venn.diagram formula and try to save it then
-```
-
-
 
